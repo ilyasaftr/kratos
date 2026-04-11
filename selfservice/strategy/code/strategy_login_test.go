@@ -403,7 +403,8 @@ func TestLoginCodeStrategy(t *testing.T) {
 					s = submitLogin(ctx, t, s, tc.apiType, func(v *url.Values) {
 						v.Set("identifier", s.identityEmail)
 					}, false, nil)
-					assert.Contains(t, s.body, "4000035", "Should not find the account")
+					assert.EqualValues(t, flow.StateEmailSent, gjson.Get(s.body, "state").String(), "%s", s.body)
+					assert.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.Get(s.body, "ui.messages.0.id").Int(), "%s", s.body)
 				})
 			})
 
@@ -557,10 +558,10 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.EqualValues(t, http.StatusOK, resp.StatusCode)
 						body, err := json.Marshal(lf)
 						require.NoError(t, err)
-						assert.Contains(t, gjson.GetBytes(body, "ui.messages.0.text").String(), "account does not exist or has not setup sign in with code")
+						assert.Contains(t, gjson.GetBytes(body, "ui.messages.0.text").String(), "The login code is invalid or has already been used")
 					} else {
 						require.EqualValues(t, http.StatusBadRequest, resp.StatusCode)
-						assert.Contains(t, gjson.Get(body, "ui.messages.0.text").String(), "account does not exist or has not setup sign in with code")
+						assert.Contains(t, gjson.Get(body, "ui.messages.0.text").String(), "The login code is invalid or has already been used")
 					}
 				})
 			})
@@ -581,10 +582,12 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.EqualValues(t, http.StatusOK, resp.StatusCode)
 						body, err := json.Marshal(lf)
 						require.NoError(t, err)
-						assert.Contains(t, gjson.GetBytes(body, "ui.messages.0.text").String(), "account does not exist or has not setup sign in with code")
+						assert.EqualValues(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
+						assert.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 					} else {
 						require.EqualValues(t, http.StatusBadRequest, resp.StatusCode)
-						assert.Contains(t, gjson.Get(body, "ui.messages.0.text").String(), "account does not exist or has not setup sign in with code")
+						assert.EqualValues(t, flow.StateEmailSent, gjson.Get(body, "state").String(), "%s", body)
+						assert.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.Get(body, "ui.messages.0.id").Int(), "%s", body)
 					}
 				})
 			})
