@@ -93,7 +93,7 @@ type updateVerificationFlowWithCodeMethod struct {
 	// If the provided address belongs to a valid account, a verification email or SMS will be sent.
 	//
 	// If you want to notify the email address if the account does not exist, see
-	// the [notify_unknown_recipients flag](https://www.ory.sh/docs/kratos/self-service/flows/verify-email-account-activation#attempted-verification-notifications)
+	// the [notify_unknown_recipients flag](https://www.ory.com/docs/kratos/self-service/flows/verify-email-account-activation#attempted-verification-notifications)
 	//
 	// If a code was already sent, including this field in the payload will invalidate the sent code and re-send a new code.
 	//
@@ -218,7 +218,7 @@ func (s *Strategy) verificationHandleFormSubmission(ctx context.Context, w http.
 
 	via := hackyInferChannel(body.Email)
 	if err := s.deps.CodeSender().SendVerificationCode(ctx, f, via, body.Email); err != nil {
-		if !errors.Is(err, ErrUnknownAddress) {
+		if !errors.Is(err, ErrUnknownAddress()) {
 			return s.handleVerificationError(r, f, body, err)
 		}
 		// Continue execution
@@ -251,7 +251,7 @@ func (s *Strategy) verificationHandleFormSubmission(ctx context.Context, w http.
 
 func (s *Strategy) verificationUseCode(ctx context.Context, w http.ResponseWriter, r *http.Request, codeString string, f *verification.Flow) error {
 	code, err := s.deps.VerificationCodePersister().UseVerificationCode(ctx, f.ID, codeString)
-	if errors.Is(err, ErrCodeNotFound) {
+	if errors.Is(err, ErrCodeNotFound()) {
 		f.UI.Messages.Clear()
 		f.UI.Messages.Add(text.NewErrorValidationVerificationCodeInvalidOrAlreadyUsed())
 		if err := s.deps.VerificationFlowPersister().UpdateVerificationFlow(ctx, f); err != nil {

@@ -192,20 +192,20 @@ func parseListIdentitiesParameters(r *http.Request) (params ListIdentityParamete
 		for _, v := range ids {
 			id, err := uuid.FromString(v)
 			if err != nil {
-				return params, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Invalid UUID value `%s` for parameter `ids`.", v))
+				return params, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Invalid UUID value `%s` for parameter `ids`.", v))
 			}
 			params.IdsFilter = append(params.IdsFilter, id)
 		}
 	}
 	if len(params.IdsFilter) > 500 {
-		return params, errors.WithStack(herodot.ErrBadRequest.WithReason("The number of ids to filter must not exceed 500."))
+		return params, errors.WithStack(herodot.ErrBadRequest().WithReason("The number of ids to filter must not exceed 500."))
 	}
 
 	if orgID := query.Get("organization_id"); orgID != "" {
 		requestedFilters++
 		params.OrganizationID, err = uuid.FromString(orgID)
 		if err != nil {
-			return params, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Invalid UUID value `%s` for parameter `organization_id`.", orgID))
+			return params, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Invalid UUID value `%s` for parameter `organization_id`.", orgID))
 		}
 	}
 
@@ -225,13 +225,13 @@ func parseListIdentitiesParameters(r *http.Request) (params ListIdentityParamete
 		params.Expand = ExpandEverything
 		tc, ok := ParseCredentialsType(v)
 		if !ok {
-			return params, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Invalid value `%s` for parameter `include_credential`.", v))
+			return params, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Invalid value `%s` for parameter `include_credential`.", v))
 		}
 		params.DeclassifyCredentials = append(params.DeclassifyCredentials, tc)
 	}
 
 	if requestedFilters > 1 {
-		return params, errors.WithStack(herodot.ErrBadRequest.WithReason("You cannot combine multiple filters in this API"))
+		return params, errors.WithStack(herodot.ErrBadRequest().WithReason("You cannot combine multiple filters in this API"))
 	}
 
 	params.KeySetPagination, params.PagePagination, err = x.ParseKeysetOrPagePagination(r)
@@ -247,7 +247,7 @@ func parseListIdentitiesParameters(r *http.Request) (params ListIdentityParamete
 //
 // # List Identities
 //
-// Lists all [identities](https://www.ory.sh/docs/kratos/concepts/identity-user-model) in the system. Note: filters cannot be combined.
+// Lists all [identities](https://www.ory.com/docs/kratos/concepts/identity-user-model) in the system. Note: filters cannot be combined.
 //
 //	Produces:
 //	- application/json
@@ -357,7 +357,7 @@ type getIdentityByExternalID struct {
 //
 // # Get an Identity
 //
-// Return an [identity](https://www.ory.sh/docs/kratos/concepts/identity-user-model) by its ID. You can optionally
+// Return an [identity](https://www.ory.com/docs/kratos/concepts/identity-user-model) by its ID. You can optionally
 // include credentials (e.g. social sign in connections) in the response by using the `include_credential` query parameter.
 //
 //	Consumes:
@@ -392,7 +392,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			declassify = append(declassify, tc)
 		} else {
-			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Invalid value `%s` for parameter `include_credential`.", declassify)))
+			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Invalid value `%s` for parameter `include_credential`.", declassify)))
 			return
 		}
 	}
@@ -409,7 +409,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 //
 // # Get an Identity by its External ID
 //
-// Return an [identity](https://www.ory.sh/docs/kratos/concepts/identity-user-model) by its external ID. You can optionally
+// Return an [identity](https://www.ory.com/docs/kratos/concepts/identity-user-model) by its external ID. You can optionally
 // include credentials (e.g. social sign in connections) in the response by using the `include_credential` query parameter.
 //
 //	Consumes:
@@ -433,7 +433,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getByExternalID(w http.ResponseWriter, r *http.Request) {
 	externalID := r.PathValue("externalID")
 	if externalID == "" {
-		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithReason("The external ID must not be empty.")))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReason("The external ID must not be empty.")))
 		return
 	}
 	i, err := h.r.PrivilegedIdentityPool().FindIdentityByExternalID(r.Context(), externalID, ExpandEverything)
@@ -449,7 +449,7 @@ func (h *Handler) getByExternalID(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			declassify = append(declassify, tc)
 		} else {
-			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Invalid value `%s` for parameter `include_credential`.", declassify)))
+			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Invalid value `%s` for parameter `include_credential`.", declassify)))
 			return
 		}
 	}
@@ -643,7 +643,7 @@ type AdminIdentityImportCredentialsPassword struct {
 //
 // swagger:model identityWithCredentialsPasswordConfig
 type AdminIdentityImportCredentialsPasswordConfig struct {
-	// The hashed password in [PHC format](https://www.ory.sh/docs/kratos/manage-identities/import-user-accounts-identities#hashed-passwords)
+	// The hashed password in [PHC format](https://www.ory.com/docs/kratos/manage-identities/import-user-accounts-identities#hashed-passwords)
 	HashedPassword string `json:"hashed_password"`
 
 	// The password in plain text if no hash is available.
@@ -728,8 +728,8 @@ type AdminCreateIdentityImportCredentialsSAMLProvider struct {
 //
 // # Create an Identity
 //
-// Create an [identity](https://www.ory.sh/docs/kratos/concepts/identity-user-model).  This endpoint can also be used to
-// [import credentials](https://www.ory.sh/docs/kratos/manage-identities/import-user-accounts-identities)
+// Create an [identity](https://www.ory.com/docs/kratos/concepts/identity-user-model).  This endpoint can also be used to
+// [import credentials](https://www.ory.com/docs/kratos/manage-identities/import-user-accounts-identities)
 // for instance passwords, social sign in configurations, or multifactor methods.
 //
 //	Consumes:
@@ -754,7 +754,7 @@ type AdminCreateIdentityImportCredentialsSAMLProvider struct {
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	var cr CreateIdentityBody
 	if err := jsonx.NewStrictDecoder(r.Body).Decode(&cr); err != nil {
-		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithError(err.Error())))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithError(err.Error())))
 		return
 	}
 
@@ -765,8 +765,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.r.IdentityManager().Create(r.Context(), i); err != nil {
-		if errors.Is(err, sqlcon.ErrUniqueViolation) {
-			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrConflict.WithReason("This identity conflicts with another identity that already exists.")))
+		if errors.Is(err, sqlcon.ErrUniqueViolation()) {
+			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrConflict().WithReason("This identity conflicts with another identity that already exists.")))
 		} else {
 			h.r.Writer().WriteError(w, r, err)
 		}
@@ -788,7 +788,7 @@ func (h *Handler) identityFromCreateIdentityBody(ctx context.Context, cr *Create
 	state := StateActive
 	if cr.State != "" {
 		if err := cr.State.IsValid(); err != nil {
-			return nil, errors.WithStack(herodot.ErrBadRequest.WithReasonf("%s", err).WithWrap(err))
+			return nil, errors.WithStack(herodot.ErrBadRequest().WithReasonf("%s", err).WithWrap(err))
 		}
 		state = cr.State
 	}
@@ -878,7 +878,7 @@ func (h *Handler) batchPatchIdentities(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Identities) > BatchPatchIdentitiesLimit {
 		h.r.Writer().WriteErrorCode(w, r, http.StatusBadRequest,
-			errors.WithStack(herodot.ErrBadRequest.WithReasonf(
+			errors.WithStack(herodot.ErrBadRequest().WithReasonf(
 				"The maximum number of identities per request that can be created or deleted at once is %d.",
 				BatchPatchIdentitiesLimit)))
 		return
@@ -914,7 +914,7 @@ func (h *Handler) batchPatchIdentities(w http.ResponseWriter, r *http.Request) {
 
 	if withUnHashedPasswordCount > BatchPatchIdentitiesWithPasswordLimit {
 		h.r.Writer().WriteErrorCode(w, r, http.StatusBadRequest,
-			errors.WithStack(herodot.ErrBadRequest.WithReasonf(
+			errors.WithStack(herodot.ErrBadRequest().WithReasonf(
 				"The maximum number of identities per request that can be created with a plaintext password is %d.",
 				BatchPatchIdentitiesWithPasswordLimit)))
 		return
@@ -1007,7 +1007,7 @@ type UpdateIdentityBody struct {
 //
 // # Update an Identity
 //
-// This endpoint updates an [identity](https://www.ory.sh/docs/kratos/concepts/identity-user-model). The full identity
+// This endpoint updates an [identity](https://www.ory.com/docs/kratos/concepts/identity-user-model). The full identity
 // payload (except credentials) is expected.
 //
 // It is possible to update the identity's credentials as well. Using this operation, credentials will not be overwritten
@@ -1063,7 +1063,7 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 
 	if ur.State != "" && identity.State != ur.State {
 		if err := ur.State.IsValid(); err != nil {
-			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("%s", err).WithWrap(err)))
+			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("%s", err).WithWrap(err)))
 			return
 		}
 
@@ -1116,7 +1116,7 @@ type deleteIdentity struct {
 //
 // # Delete an Identity
 //
-// Calling this endpoint irrecoverably and permanently deletes the [identity](https://www.ory.sh/docs/kratos/concepts/identity-user-model) given its ID. This action can not be undone.
+// Calling this endpoint irrecoverably and permanently deletes the [identity](https://www.ory.com/docs/kratos/concepts/identity-user-model) given its ID. This action can not be undone.
 // This endpoint returns 204 when the identity was deleted or 404 if the identity was not found.
 //
 //	Produces:
@@ -1164,7 +1164,7 @@ type patchIdentity struct {
 //
 // # Patch an Identity
 //
-// Partially updates an [identity's](https://www.ory.sh/docs/kratos/concepts/identity-user-model) field using [JSON Patch](https://jsonpatch.com/).
+// Partially updates an [identity's](https://www.ory.com/docs/kratos/concepts/identity-user-model) field using [JSON Patch](https://jsonpatch.com/).
 // The fields `id`, `stateChangedAt` and `credentials` can not be updated using this method.
 //
 //	Consumes:
@@ -1206,8 +1206,7 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 	patchedIdentity, err := jsonx.ApplyJSONPatch(requestBody, WithCredentialsAndAdminMetadataInJSON(*identity), "/id", "/stateChangedAt", "/credentials", "/credentials/oidc/**")
 	if err != nil {
 		h.r.Writer().WriteError(w, r, errors.WithStack(
-			herodot.
-				ErrBadRequest.
+			herodot.ErrBadRequest().
 				WithReasonf("An error occured when applying the JSON patch").
 				WithErrorf("%v", err).
 				WithWrap(err),
@@ -1219,8 +1218,7 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 		// Check if the changed state was actually valid
 		if err := patchedIdentity.State.IsValid(); err != nil {
 			h.r.Writer().WriteError(w, r, errors.WithStack(
-				herodot.
-					ErrBadRequest.
+				herodot.ErrBadRequest().
 					WithReasonf("The supplied state ('%s') was not valid. Valid states are ('%s', '%s').", string(patchedIdentity.State), StateActive, StateInactive).
 					WithErrorf("%v", err).
 					WithWrap(err),
@@ -1275,7 +1273,7 @@ type _ struct {
 //
 // # Delete a credential for a specific identity
 //
-// Delete an [identity](https://www.ory.sh/docs/kratos/concepts/identity-user-model) credential by its type.
+// Delete an [identity](https://www.ory.com/docs/kratos/concepts/identity-user-model) credential by its type.
 // You cannot delete passkeys or code auth credentials through this API.
 //
 //	Consumes:
@@ -1306,7 +1304,7 @@ func (h *Handler) deleteIdentityCredentials(w http.ResponseWriter, r *http.Reque
 
 	cred, ok := identity.GetCredentials(CredentialsType(r.PathValue("type")))
 	if !ok {
-		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrNotFound.WithReasonf("You tried to remove a %s but this user have no %s set up.", r.PathValue("type"), r.PathValue("type"))))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrNotFound().WithReasonf("You tried to remove a %s but this user have no %s set up.", r.PathValue("type"), r.PathValue("type"))))
 		return
 	}
 
@@ -1325,7 +1323,7 @@ func (h *Handler) deleteIdentityCredentials(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if firstFactor < 2 {
-			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithReason("You cannot remove the last first factor credential.")))
+			h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReason("You cannot remove the last first factor credential.")))
 			return
 		}
 		switch cred.Type {
@@ -1342,7 +1340,7 @@ func (h *Handler) deleteIdentityCredentials(w http.ResponseWriter, r *http.Reque
 		}
 	default:
 		// A bunch of credential type deletions are not yet implemented, e.g. passkeys, etc.
-		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Credentials type %s cannot be deleted.", cred.Type)))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Credentials type %s cannot be deleted.", cred.Type)))
 		return
 	}
 

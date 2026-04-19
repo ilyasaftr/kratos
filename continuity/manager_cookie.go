@@ -21,9 +21,12 @@ import (
 	"github.com/ory/kratos/x"
 )
 
+func ErrNotResumable() *herodot.DefaultError {
+	return herodot.ErrBadRequest().WithError("no resumable session found").WithReasonf("The browser does not contain the necessary cookie to resume the session. This is a security violation and was blocked. Please clear your browser's cookies and cache and try again!")
+}
+
 var (
-	_               Manager = new(ManagerCookie)
-	ErrNotResumable         = *herodot.ErrBadRequest.WithError("no resumable session found").WithReasonf("The browser does not contain the necessary cookie to resume the session. This is a security violation and was blocked. Please clear your browser's cookies and cache and try again!")
+	_ Manager = new(ManagerCookie)
 )
 
 const CookieName = "ory_kratos_continuity"
@@ -99,7 +102,7 @@ func (m *ManagerCookie) Continue(ctx context.Context, w http.ResponseWriter, r *
 			ctx,
 			container.ID,
 			time.Now().UTC().Add(o.setExpiresIn).Truncate(time.Second),
-		); err != nil && !errors.Is(err, sqlcon.ErrNoRows) {
+		); err != nil && !errors.Is(err, sqlcon.ErrNoRows()) {
 			return nil, err
 		}
 	} else {
@@ -107,7 +110,7 @@ func (m *ManagerCookie) Continue(ctx context.Context, w http.ResponseWriter, r *
 			return nil, err
 		}
 
-		if err := m.d.ContinuityPersister().DeleteContinuitySession(ctx, container.ID); err != nil && !errors.Is(err, sqlcon.ErrNoRows) {
+		if err := m.d.ContinuityPersister().DeleteContinuitySession(ctx, container.ID); err != nil && !errors.Is(err, sqlcon.ErrNoRows()) {
 			return nil, err
 		}
 	}
@@ -119,13 +122,13 @@ func (m *ManagerCookie) sessionID(ctx context.Context, w http.ResponseWriter, r 
 	s, err := x.SessionGetString(r, m.d.ContinuityCookieManager(ctx), CookieName, name)
 	if err != nil {
 		_ = x.SessionUnsetKey(w, r, m.d.ContinuityCookieManager(ctx), CookieName, name)
-		return uuid.Nil, errors.WithStack(ErrNotResumable.WithDebugf("%+v", err))
+		return uuid.Nil, errors.WithStack(ErrNotResumable().WithDebugf("%+v", err))
 	}
 
 	sid, err := uuid.FromString(s)
 	if err != nil {
 		_ = x.SessionUnsetKey(w, r, m.d.ContinuityCookieManager(ctx), CookieName, name)
-		return uuid.Nil, errors.WithStack(ErrNotResumable.WithDebug("session id is not a valid uuid"))
+		return uuid.Nil, errors.WithStack(ErrNotResumable().WithDebug("session id is not a valid uuid"))
 	}
 
 	return sid, nil
@@ -143,13 +146,13 @@ func (m *ManagerCookie) container(ctx context.Context, w http.ResponseWriter, r 
 		_ = x.SessionUnsetKey(w, r, m.d.ContinuityCookieManager(ctx), CookieName, name)
 	}
 
-	if errors.Is(err, sqlcon.ErrNoRows) {
-		return nil, errors.WithStack(ErrNotResumable.WithDebugf("Resumable ID from cookie could not be found in the datastore: %+v", err))
+	if errors.Is(err, sqlcon.ErrNoRows()) {
+		return nil, errors.WithStack(ErrNotResumable().WithDebugf("Resumable ID from cookie could not be found in the datastore: %+v", err))
 	} else if err != nil {
 		return nil, err
 	} else if container.ExpiresAt.Before(time.Now()) {
 		_ = x.SessionUnsetKey(w, r, m.d.ContinuityCookieManager(ctx), CookieName, name)
-		return nil, errors.WithStack(ErrNotResumable.WithDebugf("Resumable session has expired"))
+		return nil, errors.WithStack(ErrNotResumable().WithDebugf("Resumable session has expired"))
 	}
 
 	return container, err
@@ -159,7 +162,7 @@ func (m ManagerCookie) Abort(ctx context.Context, w http.ResponseWriter, r *http
 	ctx, span := m.d.Tracer(ctx).Tracer().Start(ctx, "continuity.ManagerCookie.Abort")
 	defer otelx.End(span, &err)
 	sid, err := m.sessionID(ctx, w, r, name)
-	if errors.Is(err, &ErrNotResumable) {
+	if errors.Is(err, ErrNotResumable()) {
 		// We do not care about an error here
 		return nil
 	} else if err != nil {
@@ -170,7 +173,7 @@ func (m ManagerCookie) Abort(ctx context.Context, w http.ResponseWriter, r *http
 		return err
 	}
 
-	if err := m.d.ContinuityPersister().DeleteContinuitySession(ctx, sid); err != nil && !errors.Is(err, sqlcon.ErrNoRows) {
+	if err := m.d.ContinuityPersister().DeleteContinuitySession(ctx, sid); err != nil && !errors.Is(err, sqlcon.ErrNoRows()) {
 		return errors.WithStack(err)
 	}
 

@@ -24,7 +24,9 @@ import (
 	"github.com/ory/x/randx"
 )
 
-var ErrIdentityDisabled = herodot.ErrBadRequest.WithID(text.ErrIDIdentityDisabled).WithError("identity is disabled").WithReason("This account was disabled.")
+func ErrIdentityDisabled() *herodot.DefaultError {
+	return herodot.ErrBadRequest().WithID(text.ErrIDIdentityDisabled).WithError("identity is disabled").WithReason("This account was disabled.")
+}
 
 type lifespanProvider interface {
 	SessionLifespan(ctx context.Context) time.Duration
@@ -98,7 +100,7 @@ type Session struct {
 	// Generally, "aal1" implies that one authentication factor was used while AAL2 implies that two factors (e.g.
 	// password + TOTP) have been used.
 	//
-	// To learn more about these levels please head over to: https://www.ory.sh/kratos/docs/concepts/credentials
+	// To learn more about these levels please head over to: https://www.ory.com/kratos/docs/concepts/credentials
 	AuthenticatorAssuranceLevel identity.AuthenticatorAssuranceLevel `faker:"aal_type" db:"aal" json:"authenticator_assurance_level"`
 
 	// Authentication Method References (AMR)
@@ -163,6 +165,36 @@ func (Session) DefaultPageToken() keysetpagination.PageToken {
 }
 
 func (Session) TableName() string { return "sessions" }
+
+// AdminSession is a Session that preserves metadata_admin on the embedded
+// identity during JSON marshaling. Use this type (or AdminSessions for slices)
+// when writing responses from admin endpoints.
+type AdminSession Session
+
+func (s AdminSession) MarshalJSON() ([]byte, error) {
+	type sessionAlias Session
+	type adminSession struct {
+		sessionAlias
+		Identity *identity.WithAdminMetadataInJSON `json:"identity"`
+	}
+	session := Session(s)
+	session.Active = session.IsActive()
+
+	return json.Marshal(adminSession{
+		sessionAlias: sessionAlias(session),
+		Identity:     (*identity.WithAdminMetadataInJSON)(session.Identity),
+	})
+}
+
+// AdminSessions converts a slice of Session to a slice of AdminSession for
+// admin endpoint responses that need to include metadata_admin.
+func AdminSessions(sessions []Session) []AdminSession {
+	result := make([]AdminSession, len(sessions))
+	for i, s := range sessions {
+		result[i] = AdminSession(s)
+	}
+	return result
+}
 
 func (s *Session) CompletedLoginForMethod(method AuthenticationMethod) {
 	method.CompletedAt = time.Now().UTC()
