@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/httpx"
@@ -51,6 +50,8 @@ type (
 		config.Provider
 
 		continuity.ManagementProvider
+
+		x.CookieProvider
 
 		session.HandlerProvider
 		session.ManagementProvider
@@ -170,8 +171,7 @@ func (s *Strategy) continueFlow(ctx context.Context, r *http.Request, ctxUpdate 
 	}
 
 	options := []identity.ManagerOption{identity.ManagerExposeValidationErrorsForInternalTypeAssertion}
-	ttl := s.d.Config().SelfServiceFlowSettingsPrivilegedSessionMaxAge(ctx)
-	if ctxUpdate.Session.AuthenticatedAt.Add(ttl).After(time.Now()) {
+	if s.d.SessionManager().IsPrivileged(ctx, ctxUpdate.Session) {
 		options = append(options, identity.ManagerAllowWriteProtectedTraits)
 	}
 
@@ -246,8 +246,9 @@ func (s *Strategy) hydrateForm(r *http.Request, ar *settings.Flow, traits json.R
 // during a settings request.
 func (s *Strategy) handleSettingsError(ctx context.Context, w http.ResponseWriter, r *http.Request, puc *settings.UpdateContext, traits json.RawMessage, p updateSettingsFlowWithProfileMethod, err error) error {
 	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) {
-		if err := s.d.ContinuityManager().Pause(ctx, w, r,
+		if _, err := s.d.ContinuityManager().Pause(ctx, w, r,
 			settings.ContinuityKey(s.SettingsStrategyID()),
+			continuity.NewCookieReferenceStore(s.d.ContinuityCookieManager(ctx)),
 			settings.ContinuityOptions(p, puc.GetSessionIdentity())...); err != nil {
 			return err
 		}
