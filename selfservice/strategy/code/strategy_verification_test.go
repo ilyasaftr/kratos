@@ -7,12 +7,13 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
+	"github.com/ory/x/clock"
 	"github.com/ory/x/configx"
 	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
 
@@ -32,6 +34,7 @@ import (
 	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
+	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/selfservice/flow/verification"
 	"github.com/ory/kratos/selfservice/strategy/code"
 	"github.com/ory/kratos/text"
@@ -214,7 +217,6 @@ func TestVerification(t *testing.T) {
 	})
 
 	t.Run("description=should accept a phone number for verification", func(t *testing.T) {
-
 		phoneNumber := "+12065551234"
 		phoneIdentity := &identity.Identity{
 			ID:       x.NewUUID(),
@@ -290,7 +292,6 @@ func TestVerification(t *testing.T) {
 	})
 
 	t.Run("description=should not send SMS for unknown phone number", func(t *testing.T) {
-
 		check := func(t *testing.T, actual string) {
 			assert.EqualValues(t, string(node.CodeGroup), gjson.Get(actual, "active").String(), "%s", actual)
 			assertx.EqualAsJSON(t, text.NewVerificationPhoneWithCodeSent(), json.RawMessage(gjson.Get(actual, "ui.messages.0").Raw))
@@ -407,15 +408,19 @@ func TestVerification(t *testing.T) {
 	})
 
 	t.Run("description=should not be able to submit email in expired flow", func(t *testing.T) {
-		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, 100*time.Millisecond)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
-		})
+		// Drive expiry with a deterministic clock instead of a real sleep, so the
+		// "expired N minutes ago" message no longer depends on wall-clock timing.
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+
+		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
 
 		c := testhelpers.NewClientWithCookies(t)
 		rs := testhelpers.GetVerificationFlow(t, c, public)
 
-		time.Sleep(101 * time.Millisecond)
+		// 1-minute lifespan + 2 minutes => deterministically "expired 2.00 minutes ago".
+		mockClock.Add(3 * time.Minute)
 
 		res, err := c.PostForm(rs.Ui.Action, url.Values{"method": {"code"}, "email": {verificationEmail}})
 		require.NoError(t, err)
@@ -423,14 +428,17 @@ func TestVerification(t *testing.T) {
 		assert.NotContains(t, res.Request.URL.String(), "flow="+rs.Id)
 		assert.Contains(t, res.Request.URL.String(), conf.SelfServiceFlowVerificationUI(ctx).String())
 		body := ioutilx.MustReadAll(res.Body)
-		assert.Regexpf(t, regexp.MustCompile(`The verification flow expired 0\.0\d minutes ago, please try again\.`), gjson.GetBytes(body, "ui.messages.0.text").Str, "%s", body)
+		assert.Equalf(t, "The verification flow expired 2.00 minutes ago, please try again.", gjson.GetBytes(body, "ui.messages.0.text").Str, "%s", body)
 	})
 
 	t.Run("description=should not be able to submit code in expired flow", func(t *testing.T) {
-		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, 100*time.Millisecond)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
-		})
+		// Deterministic clock: the courier still runs on the real clock, only flow
+		// expiry is driven by the mock, so the assertion no longer races the load.
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+
+		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
 
 		c := testhelpers.NewClientWithCookies(t)
 		body := expectSuccess(t, c, false, false, func(v url.Values) {
@@ -442,11 +450,12 @@ func TestVerification(t *testing.T) {
 
 		code := testhelpers.CourierExpectCodeInMessage(t, message, 1)
 
-		time.Sleep(101 * time.Millisecond)
+		// 1-minute lifespan + 2 minutes => deterministically "expired 2.00 minutes ago".
+		mockClock.Add(3 * time.Minute)
 
 		f, _ := submitVerificationCode(t, body, c, code)
 
-		assert.Regexpf(t, regexp.MustCompile(`The verification flow expired 0\.0\d minutes ago, please try again\.`), gjson.Get(f, "ui.messages.0.text").Str, "%s", body)
+		assert.Equalf(t, "The verification flow expired 2.00 minutes ago, please try again.", gjson.Get(f, "ui.messages.0.text").Str, "%s", body)
 	})
 
 	t.Run("description=should verify an email address", func(t *testing.T) {
@@ -542,7 +551,7 @@ func TestVerification(t *testing.T) {
 	})
 
 	newValidFlow := func(t *testing.T, fType flow.Type, requestURL string) (*verification.Flow, *code.VerificationCode, string) {
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", requestURL, nil), verification.Strategies{code.NewStrategy(reg)}, fType)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", requestURL, nil), verification.Strategies{code.NewStrategy(reg)}, fType)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		u, err := url.Parse(f.RequestURL)
@@ -841,6 +850,7 @@ func TestVerification(t *testing.T) {
 		// Create an identity with original traits.
 		pendingID := &identity.Identity{
 			ID:       x.NewUUID(),
+			State:    identity.StateActive,
 			Traits:   identity.Traits(`{"email":"original-code@ory.sh"}`),
 			SchemaID: config.DefaultIdentityTraitsSchemaID,
 			Credentials: map[identity.CredentialsType]identity.Credentials{
@@ -849,22 +859,46 @@ func TestVerification(t *testing.T) {
 		}
 		require.NoError(t, reg.IdentityManager().Create(ctx, pendingID, identity.ManagerAllowWriteProtectedTraits))
 
+		// The apply step now requires a live session that created the change.
+		sess, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, pendingID,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+
 		// Create a verification flow in StateEmailSent.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
 
+		// Create a settings flow that acts as the origin for the PTC.
+		sfApply := &settings.Flow{
+			ID:              x.NewUUID(),
+			ExpiresAt:       time.Now().UTC().Add(time.Hour),
+			IssuedAt:        time.Now().UTC(),
+			RequestURL:      public.URL + "/settings",
+			IdentityID:      pendingID.ID,
+			Identity:        pendingID,
+			Type:            flow.TypeBrowser,
+			State:           flow.StateShowForm,
+			InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfApply))
+
 		// Create a PendingTraitsChange record linked to this flow.
+		sessID := sess.ID
+		originFlowIDApply := sfApply.ID
 		ptc := &identity.PendingTraitsChange{
-			ID:                 x.NewUUID(),
-			IdentityID:         pendingID.ID,
-			NewAddressValue:    "changed-code@ory.sh",
-			NewAddressVia:      string(identity.AddressTypeEmail),
-			OriginalTraitsHash: identity.HashTraits(json.RawMessage(pendingID.Traits)),
-			ProposedTraits:     json.RawMessage(`{"email":"changed-code@ory.sh"}`),
-			VerificationFlowID: f.ID,
-			Status:             identity.PendingTraitsChangeStatusPending,
+			ID:                   x.NewUUID(),
+			IdentityID:           pendingID.ID,
+			SessionID:            uuid.NullUUID{UUID: sessID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: originFlowIDApply, Valid: true},
+			NewAddressValue:      "changed-code@ory.sh",
+			NewAddressVia:        string(identity.AddressTypeEmail),
+			OriginalTraitsHash:   identity.HashTraits(json.RawMessage(pendingID.Traits)),
+			ProposedTraits:       json.RawMessage(`{"email":"changed-code@ory.sh"}`),
+			VerificationFlowID:   f.ID,
+			Status:               identity.PendingTraitsChangeStatusPending,
 		}
 		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptc))
 
@@ -909,16 +943,211 @@ func TestVerification(t *testing.T) {
 		require.NotNil(t, foundAddress, "new address should exist on identity")
 		assert.True(t, foundAddress.Verified)
 		assert.EqualValues(t, identity.VerifiableAddressStatusCompleted, foundAddress.Status)
+	})
 
-		// The pending change should no longer be found as "pending" (it was completed).
-		_, ptcErr := reg.PendingTraitsChangePersister().GetPendingTraitsChangeByVerificationFlow(ctx, f.ID)
-		assert.Error(t, ptcErr, "completed PTC should not be returned by the pending-only query")
+	t.Run("description=fires settings post-persist webhook after pending traits change is applied", func(t *testing.T) {
+		// Set up a recording webhook target.
+		var receivedBody []byte
+		receivedCh := make(chan struct{}, 1)
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedBody, _ = io.ReadAll(r.Body)
+			select {
+			case receivedCh <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(ts.Close)
+
+		// Register webhook as a settings-profile post-persist hook.
+		conf.MustSet(ctx, "selfservice.flows.settings.after.profile.hooks", []map[string]any{
+			{
+				"hook": "web_hook",
+				"config": map[string]any{
+					"url":    ts.URL,
+					"method": "POST",
+					"body":   "base64://" + base64.StdEncoding.EncodeToString([]byte(`function(ctx) ctx`)),
+				},
+			},
+		})
+		t.Cleanup(func() {
+			conf.MustSet(ctx, "selfservice.flows.settings.after.profile.hooks", []map[string]any{})
+		})
+
+		// Create an identity + active session.
+		ident := &identity.Identity{
+			ID:       x.NewUUID(),
+			Traits:   identity.Traits(`{"email":"posthook-original@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+			State:    identity.StateActive,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, ident, identity.ManagerAllowWriteProtectedTraits))
+		sess, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, ident, time.Now().UTC(),
+			identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+
+		// Create verification flow + PTC linked to the session.
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		f.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
+
+		// Create a settings flow that acts as the origin for the PTC.
+		sfHook := &settings.Flow{
+			ID:              x.NewUUID(),
+			ExpiresAt:       time.Now().UTC().Add(time.Hour),
+			IssuedAt:        time.Now().UTC(),
+			RequestURL:      public.URL + "/settings",
+			IdentityID:      ident.ID,
+			Identity:        ident,
+			Type:            flow.TypeBrowser,
+			State:           flow.StateShowForm,
+			InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfHook))
+
+		sessID := sess.ID
+		originFlowIDHook := sfHook.ID
+		ptc := &identity.PendingTraitsChange{
+			ID:                   x.NewUUID(),
+			IdentityID:           ident.ID,
+			SessionID:            uuid.NullUUID{UUID: sessID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: originFlowIDHook, Valid: true},
+			NewAddressValue:      "posthook-new@ory.sh",
+			NewAddressVia:        string(identity.AddressTypeEmail),
+			OriginalTraitsHash:   identity.HashTraits(json.RawMessage(ident.Traits)),
+			ProposedTraits:       json.RawMessage(`{"email":"posthook-new@ory.sh"}`),
+			VerificationFlowID:   f.ID,
+			Status:               identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptc))
+
+		rawCode := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode:           rawCode,
+			ExpiresIn:         time.Hour,
+			VerifiableAddress: ptc,
+			FlowID:            f.ID,
+		})
+		require.NoError(t, err)
+
+		cl := testhelpers.NewClientWithCookies(t)
+		res, err := cl.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+f.ID.String(),
+			url.Values{"code": {rawCode}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		require.NoError(t, res.Body.Close())
+		require.Equal(t, http.StatusOK, res.StatusCode)
+
+		select {
+		case <-receivedCh:
+		case <-time.After(5 * time.Second):
+			t.Fatal("settings post-persist webhook was not invoked after pending traits change applied")
+		}
+		assert.Contains(t, string(receivedBody), "posthook-new@ory.sh")
+	})
+
+	t.Run("description=post-persist webhook error after pending traits change is surfaced", func(t *testing.T) {
+		// Webhook target that always returns 500.
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"boom"}`))
+		}))
+		t.Cleanup(ts.Close)
+
+		conf.MustSet(ctx, "selfservice.flows.settings.after.profile.hooks", []map[string]any{
+			{
+				"hook": "web_hook",
+				"config": map[string]any{
+					"url":    ts.URL,
+					"method": "POST",
+					"body":   "base64://" + base64.StdEncoding.EncodeToString([]byte(`function(ctx) ctx`)),
+				},
+			},
+		})
+		t.Cleanup(func() {
+			conf.MustSet(ctx, "selfservice.flows.settings.after.profile.hooks", []map[string]any{})
+		})
+
+		ident := &identity.Identity{
+			ID:       x.NewUUID(),
+			Traits:   identity.Traits(`{"email":"posthook-err-original@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+			State:    identity.StateActive,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, ident, identity.ManagerAllowWriteProtectedTraits))
+		sess, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, ident, time.Now().UTC(),
+			identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		f.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
+
+		// Create a settings flow that acts as the origin for the PTC.
+		sfErr := &settings.Flow{
+			ID:              x.NewUUID(),
+			ExpiresAt:       time.Now().UTC().Add(time.Hour),
+			IssuedAt:        time.Now().UTC(),
+			RequestURL:      public.URL + "/settings",
+			IdentityID:      ident.ID,
+			Identity:        ident,
+			Type:            flow.TypeBrowser,
+			State:           flow.StateShowForm,
+			InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfErr))
+
+		sessID := sess.ID
+		originFlowIDErr := sfErr.ID
+		ptc := &identity.PendingTraitsChange{
+			ID:                   x.NewUUID(),
+			IdentityID:           ident.ID,
+			SessionID:            uuid.NullUUID{UUID: sessID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: originFlowIDErr, Valid: true},
+			NewAddressValue:      "posthook-err-new@ory.sh",
+			NewAddressVia:        string(identity.AddressTypeEmail),
+			OriginalTraitsHash:   identity.HashTraits(json.RawMessage(ident.Traits)),
+			ProposedTraits:       json.RawMessage(`{"email":"posthook-err-new@ory.sh"}`),
+			VerificationFlowID:   f.ID,
+			Status:               identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptc))
+
+		rawCode := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode:           rawCode,
+			ExpiresIn:         time.Hour,
+			VerifiableAddress: ptc,
+			FlowID:            f.ID,
+		})
+		require.NoError(t, err)
+
+		cl := testhelpers.NewClientWithCookies(t)
+		res, err := cl.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+f.ID.String(),
+			url.Values{"code": {rawCode}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		require.NoError(t, res.Body.Close())
+
+		// Apply already committed before the webhook fired: the new traits and
+		// the completed PTC status persist even though the hook failed.
+		updated, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, ident.ID)
+		require.NoError(t, err)
+		assert.EqualValues(t, "posthook-err-new@ory.sh", gjson.GetBytes([]byte(updated.Traits), "email").String(),
+			"traits are committed before the post-persist hook runs")
 	})
 
 	t.Run("description=should reject pending traits change on concurrent modification", func(t *testing.T) {
 		// Create an identity with original traits.
 		concurrentID := &identity.Identity{
 			ID:       x.NewUUID(),
+			State:    identity.StateActive,
 			Traits:   identity.Traits(`{"email":"original2-code@ory.sh"}`),
 			SchemaID: config.DefaultIdentityTraitsSchemaID,
 			Credentials: map[identity.CredentialsType]identity.Credentials{
@@ -926,6 +1155,13 @@ func TestVerification(t *testing.T) {
 			},
 		}
 		require.NoError(t, reg.IdentityManager().Create(ctx, concurrentID, identity.ManagerAllowWriteProtectedTraits))
+
+		// A live session is required so we reach the traits-hash check rather
+		// than bailing at the SessionID-nil guard first.
+		sess, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, concurrentID,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
 		// Compute traits hash from the original traits.
 		originalHash := identity.HashTraits(json.RawMessage(concurrentID.Traits))
@@ -935,21 +1171,39 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.IdentityManager().Update(ctx, concurrentID, identity.ManagerAllowWriteProtectedTraits))
 
 		// Create a verification flow in StateEmailSent.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
 
+		// Create a settings flow that acts as the origin for the PTC.
+		sfConc := &settings.Flow{
+			ID:              x.NewUUID(),
+			ExpiresAt:       time.Now().UTC().Add(time.Hour),
+			IssuedAt:        time.Now().UTC(),
+			RequestURL:      public.URL + "/settings",
+			IdentityID:      concurrentID.ID,
+			Identity:        concurrentID,
+			Type:            flow.TypeBrowser,
+			State:           flow.StateShowForm,
+			InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfConc))
+
 		// Create a PendingTraitsChange with the OLD traits hash (before concurrent modification).
+		sessID := sess.ID
+		originFlowIDConc := sfConc.ID
 		ptc := &identity.PendingTraitsChange{
-			ID:                 x.NewUUID(),
-			IdentityID:         concurrentID.ID,
-			NewAddressValue:    "changed2-code@ory.sh",
-			NewAddressVia:      string(identity.AddressTypeEmail),
-			OriginalTraitsHash: originalHash,
-			ProposedTraits:     json.RawMessage(`{"email":"changed2-code@ory.sh"}`),
-			VerificationFlowID: f.ID,
-			Status:             identity.PendingTraitsChangeStatusPending,
+			ID:                   x.NewUUID(),
+			IdentityID:           concurrentID.ID,
+			SessionID:            uuid.NullUUID{UUID: sessID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: originFlowIDConc, Valid: true},
+			NewAddressValue:      "changed2-code@ory.sh",
+			NewAddressVia:        string(identity.AddressTypeEmail),
+			OriginalTraitsHash:   originalHash,
+			ProposedTraits:       json.RawMessage(`{"email":"changed2-code@ory.sh"}`),
+			VerificationFlowID:   f.ID,
+			Status:               identity.PendingTraitsChangeStatusPending,
 		}
 		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptc))
 
@@ -982,5 +1236,225 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, err)
 		assert.EqualValues(t, "concurrent-code@ory.sh", gjson.GetBytes([]byte(unchanged.Traits), "email").String(),
 			"traits should remain at the concurrent value, not the proposed value")
+	})
+
+	t.Run("description=should reject pending traits change when session is revoked", func(t *testing.T) {
+		ident := &identity.Identity{
+			ID:       x.NewUUID(),
+			State:    identity.StateActive,
+			Traits:   identity.Traits(`{"email":"revoke-original@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, ident, identity.ManagerAllowWriteProtectedTraits))
+
+		sess, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, ident,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		f.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
+
+		// Create a settings flow that acts as the origin for the PTC.
+		sfRevokeCode := &settings.Flow{
+			ID:              x.NewUUID(),
+			ExpiresAt:       time.Now().UTC().Add(time.Hour),
+			IssuedAt:        time.Now().UTC(),
+			RequestURL:      public.URL + "/settings",
+			IdentityID:      ident.ID,
+			Identity:        ident,
+			Type:            flow.TypeBrowser,
+			State:           flow.StateShowForm,
+			InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfRevokeCode))
+
+		sessID := sess.ID
+		originFlowIDRevokeCode := sfRevokeCode.ID
+		ptc := &identity.PendingTraitsChange{
+			ID:                   x.NewUUID(),
+			IdentityID:           ident.ID,
+			SessionID:            uuid.NullUUID{UUID: sessID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: originFlowIDRevokeCode, Valid: true},
+			NewAddressValue:      "revoke-new@ory.sh",
+			NewAddressVia:        string(identity.AddressTypeEmail),
+			OriginalTraitsHash:   identity.HashTraits(json.RawMessage(ident.Traits)),
+			ProposedTraits:       json.RawMessage(`{"email":"revoke-new@ory.sh"}`),
+			VerificationFlowID:   f.ID,
+			Status:               identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptc))
+
+		rawCode := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode:           rawCode,
+			ExpiresIn:         time.Hour,
+			VerifiableAddress: ptc,
+			FlowID:            f.ID,
+		})
+		require.NoError(t, err)
+
+		// Revoke the session AFTER the PTC is created — simulates logout between flow start and verification.
+		require.NoError(t, reg.SessionPersister().RevokeSessionById(ctx, sess.ID))
+
+		cl := testhelpers.NewClientWithCookies(t)
+		res, err := cl.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+f.ID.String(),
+			url.Values{"code": {rawCode}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		body := string(ioutilx.MustReadAll(res.Body))
+		require.NoError(t, res.Body.Close())
+
+		assert.Contains(t, body, "The verification code is invalid or has already been used")
+
+		// Traits should NOT be updated.
+		unchanged, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, ident.ID)
+		require.NoError(t, err)
+		assert.EqualValues(t, "revoke-original@ory.sh", gjson.GetBytes([]byte(unchanged.Traits), "email").String())
+	})
+
+	t.Run("description=should show duplicate credentials error when two identities race to claim the same address", func(t *testing.T) {
+		// Both identities race past the pre-check (which is a non-atomic read) and both receive OTP codes.
+		// When the second one tries to apply the change, it hits a unique constraint violation.
+		identA := &identity.Identity{
+			ID:       x.NewUUID(),
+			State:    identity.StateActive,
+			Traits:   identity.Traits(`{"email":"race-a@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, identA, identity.ManagerAllowWriteProtectedTraits))
+
+		identB := &identity.Identity{
+			ID:       x.NewUUID(),
+			State:    identity.StateActive,
+			Traits:   identity.Traits(`{"email":"race-b@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, identB, identity.ManagerAllowWriteProtectedTraits))
+
+		sessA, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, identA,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sessA))
+
+		sessB, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, identB,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sessB))
+
+		newAddr := "race-claimed@ory.sh"
+
+		// Two separate verification flows — one per identity.
+		fA, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		fA.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, fA))
+
+		fB, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		fB.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, fB))
+
+		sfA := &settings.Flow{
+			ID: x.NewUUID(), ExpiresAt: time.Now().UTC().Add(time.Hour), IssuedAt: time.Now().UTC(),
+			RequestURL: public.URL + "/settings", IdentityID: identA.ID, Identity: identA,
+			Type: flow.TypeBrowser, State: flow.StateShowForm, InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfA))
+
+		sfB := &settings.Flow{
+			ID: x.NewUUID(), ExpiresAt: time.Now().UTC().Add(time.Hour), IssuedAt: time.Now().UTC(),
+			RequestURL: public.URL + "/settings", IdentityID: identB.ID, Identity: identB,
+			Type: flow.TypeBrowser, State: flow.StateShowForm, InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfB))
+
+		ptcA := &identity.PendingTraitsChange{
+			ID: x.NewUUID(), IdentityID: identA.ID,
+			SessionID:            uuid.NullUUID{UUID: sessA.ID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: sfA.ID, Valid: true},
+			NewAddressValue:      newAddr, NewAddressVia: string(identity.AddressTypeEmail),
+			OriginalTraitsHash: identity.HashTraits(json.RawMessage(identA.Traits)),
+			ProposedTraits:     json.RawMessage(`{"email":"` + newAddr + `"}`),
+			VerificationFlowID: fA.ID, Status: identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptcA))
+
+		ptcB := &identity.PendingTraitsChange{
+			ID: x.NewUUID(), IdentityID: identB.ID,
+			SessionID:            uuid.NullUUID{UUID: sessB.ID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: sfB.ID, Valid: true},
+			NewAddressValue:      newAddr, NewAddressVia: string(identity.AddressTypeEmail),
+			OriginalTraitsHash: identity.HashTraits(json.RawMessage(identB.Traits)),
+			ProposedTraits:     json.RawMessage(`{"email":"` + newAddr + `"}`),
+			VerificationFlowID: fB.ID, Status: identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptcB))
+
+		rawCodeA := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode: rawCodeA, ExpiresIn: time.Hour, VerifiableAddress: ptcA, FlowID: fA.ID,
+		})
+		require.NoError(t, err)
+
+		rawCodeB := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode: rawCodeB, ExpiresIn: time.Hour, VerifiableAddress: ptcB, FlowID: fB.ID,
+		})
+		require.NoError(t, err)
+
+		// Identity A verifies first — succeeds, address is now owned by A.
+		clA := testhelpers.NewClientWithCookies(t)
+		resA, err := clA.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+fA.ID.String(),
+			url.Values{"code": {rawCodeA}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		bodyA := string(ioutilx.MustReadAll(resA.Body))
+		require.NoError(t, resA.Body.Close())
+		require.Equal(t, http.StatusOK, resA.StatusCode)
+		assert.EqualValues(t, "passed_challenge", gjson.Get(bodyA, "state").String(), "identity A should pass: %s", bodyA)
+
+		// Identity B verifies second — address already claimed, should get duplicate credentials error.
+		clB := testhelpers.NewClientWithCookies(t)
+		resB, err := clB.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+fB.ID.String(),
+			url.Values{"code": {rawCodeB}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		bodyB := string(ioutilx.MustReadAll(resB.Body))
+		require.NoError(t, resB.Body.Close())
+
+		require.Equal(t, http.StatusOK, resB.StatusCode)
+		assert.EqualValues(t, "sent_email", gjson.Get(bodyB, "state").String(), "identity B should stay on verification: %s", bodyB)
+		assert.Contains(t, bodyB, "An account with the same identifier (email, phone, username, ...) exists already.", "identity B should see duplicate credentials error: %s", bodyB)
+
+		// Identity B tries to resend — the resend path re-checks uniqueness and shows the same error again.
+		// Pre-seed the CSRF cookie so EnsureCSRF passes for the resend path.
+		csrfURL, csrfCookies := nosurfx.WithFakeCSRFCookie(t, reg, public.URL)
+		clB.Jar.SetCookies(csrfURL, csrfCookies)
+		resendBody := url.Values{"email": {newAddr}, "csrf_token": {nosurfx.FakeCSRFToken}, "method": {"code"}}.Encode()
+		resendReq, err := http.NewRequest(http.MethodPost,
+			public.URL+verification.RouteSubmitFlow+"?flow="+fB.ID.String(),
+			strings.NewReader(resendBody))
+		require.NoError(t, err)
+		resendReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resendReq.Header.Set("Accept", "application/json")
+		resResend, err := clB.Do(resendReq)
+		require.NoError(t, err)
+		bodyResend := string(ioutilx.MustReadAll(resResend.Body))
+		require.NoError(t, resResend.Body.Close())
+
+		require.Equal(t, http.StatusBadRequest, resResend.StatusCode, "resend should return 400 duplicate credentials: %s", bodyResend)
+		assert.EqualValues(t, fB.ID.String(), gjson.Get(bodyResend, "id").String(), "resend should stay on the same flow: %s", bodyResend)
+		assert.Contains(t, bodyResend, "An account with the same identifier (email, phone, username, ...) exists already.", "resend should repeat the duplicate credentials error: %s", bodyResend)
+
+		// Identity B's traits must be unchanged.
+		unchangedB, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, identB.ID)
+		require.NoError(t, err)
+		assert.EqualValues(t, "race-b@ory.sh", gjson.GetBytes([]byte(unchangedB.Traits), "email").String())
 	})
 }

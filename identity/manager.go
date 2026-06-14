@@ -21,14 +21,15 @@ import (
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3"
 	"github.com/ory/kratos/courier"
+	"github.com/ory/kratos/courier/template"
+	"github.com/ory/kratos/courier/template/email"
+	"github.com/ory/kratos/courier/template/sms"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/x"
-	"github.com/ory/pop/v6"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/sqlcon"
-	"github.com/ory/x/sqlxx"
 )
 
 func ErrProtectedFieldModified() *herodot.DefaultError {
@@ -48,6 +49,7 @@ type (
 		logrusx.Provider
 		x.TransactionPersistenceProvider
 		PendingTraitsChangePersistenceProvider
+		template.Dependencies
 	}
 	ManagementProvider interface {
 		IdentityManager() *Manager
@@ -415,7 +417,7 @@ func (m *Manager) CreateIdentities(ctx context.Context, identities []*Identity, 
 		validIdentities = append(validIdentities, ident)
 	}
 
-	if err := m.r.PrivilegedIdentityPool().CreateIdentities(ctx, validIdentities...); err != nil {
+	if err := m.r.PrivilegedIdentityPool().CreateIdentities(ctx, validIdentities); err != nil {
 		if partialErr := new(CreateIdentitiesError); errors.As(err, &partialErr) {
 			createIdentitiesError.Merge(partialErr)
 		} else {
@@ -548,6 +550,16 @@ func (m *Manager) UpdateTraits(ctx context.Context, id uuid.UUID, traits Traits,
 }
 
 func (m *Manager) ValidateIdentity(ctx context.Context, i *Identity, o *ManagerOptions) (err error) {
+	// Safeguard against callers that write to i.Credentials directly with a
+	// Type field that does not match its map key. Must run before
+	// IdentityValidator.Validate, because the schema-extension pass calls
+	// SetCredentials and would silently repair Type — masking the bug
+	// while still allowing the malformed Config to overwrite the existing
+	// credential row.
+	if err := ValidateCredentialsIntegrity(i.Credentials); err != nil {
+		return err
+	}
+
 	if err := m.r.IdentityValidator().Validate(ctx, i); err != nil {
 		var validationErr *jsonschema.ValidationError
 		if errors.As(err, &validationErr) && !o.ExposeValidationErrors {
@@ -597,54 +609,75 @@ func (m *Manager) CountActiveMultiFactorCredentials(ctx context.Context, i *Iden
 
 var ErrConcurrentModification = stderrors.New("concurrent modification detected")
 
-func (m *Manager) ApplyPendingTraitsChange(ctx context.Context, ptc *PendingTraitsChange) (err error) {
-	ctx, span := m.r.Tracer(ctx).Tracer().Start(ctx, "identity.Manager.ApplyPendingTraitsChange")
+// AddressRef identifies a verifiable address by its value and channel.
+// Used by the notify_previous_addresses hook to persist the set of
+// addresses that should receive a change notification.
+type AddressRef struct {
+	Value string `json:"value"`
+	Via   string `json:"via"`
+}
+
+// SendVerifiableAddressChangedNotifications queues a change notification to
+// each target via the appropriate courier channel. Errors from individual
+// targets are collected and returned as a joined error but do not
+// short-circuit the batch — a failure to notify one recipient should not
+// prevent others from receiving their notification.
+func (m *Manager) SendVerifiableAddressChangedNotifications(
+	ctx context.Context,
+	targets []AddressRef,
+	i *Identity,
+) (err error) {
+	ctx, span := m.r.Tracer(ctx).Tracer().Start(ctx, "identity.Manager.SendVerifiableAddressChangedNotifications")
 	defer otelx.End(span, &err)
-	return m.r.TransactionalPersisterProvider().Transaction(ctx, func(ctx context.Context, connection *pop.Connection) error {
-		// Detect concurrent modifications inside the transaction.
-		currentIdentity, err := m.r.IdentityPool().GetIdentity(ctx, ptc.IdentityID, ExpandDefault)
-		if err != nil {
-			return err
-		}
 
-		if HashTraits(json.RawMessage(currentIdentity.Traits)) != ptc.OriginalTraitsHash {
-			return ErrConcurrentModification
-		}
-
-		// This is still safe, because the pending_traits_change creation is gated by a privileged session check.
-		// Since the verification flow is "session-less" because the link might open in a different browser, we cannot check privileged session status.
-		opts := []ManagerOption{ManagerAllowWriteProtectedTraits}
-		if err := m.UpdateTraits(ctx, ptc.IdentityID, Traits(ptc.ProposedTraits), opts...); err != nil {
-			return err
-		}
-
-		// Mark the pending change as completed.
-		ptc.Status = PendingTraitsChangeStatusCompleted
-		if err := m.r.PendingTraitsChangePersister().UpdatePendingTraitsChange(ctx, ptc); err != nil {
-			return err
-		}
-
-		// Load the updated identity.
-		i, err := m.r.IdentityPool().GetIdentity(ctx, ptc.IdentityID, ExpandDefault)
-		if err != nil {
-			return err
-		}
-
-		// Mark the new verifiable address as verified.
-		for idx := range i.VerifiableAddresses {
-			a := &i.VerifiableAddresses[idx]
-			if a.Value == ptc.NewAddressValue && a.Via == ptc.NewAddressVia {
-				a.Verified = true
-				verifiedAt := sqlxx.NullTime(time.Now().UTC())
-				a.VerifiedAt = &verifiedAt
-				a.Status = VerifiableAddressStatusCompleted
-				if err := m.r.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, a, "verified", "verified_at", "status"); err != nil {
-					return err
-				}
-				break
-			}
-		}
+	if len(targets) == 0 {
 		return nil
-	})
+	}
 
+	c, err := m.r.Courier(ctx)
+	if err != nil {
+		return err
+	}
+
+	model, err := x.StructToMap(i)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	changedAt := time.Now().UTC().Format(time.RFC3339)
+
+	var errs []error
+	for _, t := range targets {
+		switch t.Via {
+		case AddressTypeEmail:
+			tpl := email.NewVerifiableAddressChanged(m.r, &email.VerifiableAddressChangedModel{
+				To:        t.Value,
+				Identity:  model,
+				ChangedAt: changedAt,
+			})
+			if _, qerr := c.QueueEmail(ctx, tpl); qerr != nil {
+				m.r.Logger().WithError(qerr).
+					WithField("via", t.Via).
+					Warn("Failed to queue verifiable-address-change email.")
+				errs = append(errs, qerr)
+			}
+		case AddressTypeSMS:
+			tpl := sms.NewVerifiableAddressChanged(m.r, &sms.VerifiableAddressChangedModel{
+				To:        t.Value,
+				Identity:  model,
+				ChangedAt: changedAt,
+			})
+			if _, qerr := c.QueueSMS(ctx, tpl); qerr != nil {
+				m.r.Logger().WithError(qerr).
+					WithField("via", t.Via).
+					Warn("Failed to queue verifiable-address-change SMS.")
+				errs = append(errs, qerr)
+			}
+		default:
+			m.r.Logger().
+				WithField("via", t.Via).
+				Warn("Skipping verifiable-address-change notification target with unsupported Via.")
+		}
+	}
+
+	return stderrors.Join(errs...)
 }

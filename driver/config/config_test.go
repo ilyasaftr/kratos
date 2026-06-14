@@ -28,6 +28,8 @@ import (
 
 	"github.com/ghodss/yaml"
 
+	"github.com/go-webauthn/webauthn/protocol"
+
 	"github.com/ory/kratos/pkg/testhelpers"
 
 	"github.com/ory/x/configx"
@@ -38,6 +40,8 @@ import (
 	"github.com/ory/x/urlx"
 
 	_ "github.com/ory/jsonschema/v3/fileloader"
+
+	"github.com/gofrs/uuid"
 
 	"github.com/ory/kratos/driver/config"
 
@@ -1355,6 +1359,48 @@ func TestWebauthn(t *testing.T) {
 	})
 }
 
+func TestPasskeyConfig(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("case=defaults", func(t *testing.T) {
+		conf, err := config.New(ctx, logrusx.New("", ""), os.Stderr, &contextx.Default{},
+			configx.WithConfigFiles("stub/.kratos.passkey.yaml"))
+		require.NoError(t, err)
+
+		c := conf.PasskeyConfig(ctx)
+		// Attachment is unset by default so users can register either
+		// platform or cross-platform authenticators.
+		assert.Empty(t, c.AuthenticatorSelection.AuthenticatorAttachment)
+		require.NotNil(t, c.AuthenticatorSelection.RequireResidentKey)
+		assert.True(t, *c.AuthenticatorSelection.RequireResidentKey)
+		assert.Equal(t, protocol.ResidentKeyRequirementRequired, c.AuthenticatorSelection.ResidentKey)
+		assert.Equal(t, protocol.VerificationPreferred, c.AuthenticatorSelection.UserVerification)
+		assert.Equal(t, protocol.PreferNoAttestation, c.AttestationPreference)
+		// Timeouts should be zero (use library defaults) when not configured
+		assert.Equal(t, time.Duration(0), c.Timeouts.Registration.Timeout)
+		assert.Equal(t, time.Duration(0), c.Timeouts.Login.Timeout)
+	})
+
+	t.Run("case=reads overrides from config", func(t *testing.T) {
+		conf, err := config.New(ctx, logrusx.New("", ""), os.Stderr, &contextx.Default{},
+			configx.WithConfigFiles("stub/.kratos.passkey.options.yaml"))
+		require.NoError(t, err)
+
+		c := conf.PasskeyConfig(ctx)
+		assert.Equal(t, protocol.CrossPlatform, c.AuthenticatorSelection.AuthenticatorAttachment)
+		require.NotNil(t, c.AuthenticatorSelection.RequireResidentKey)
+		assert.False(t, *c.AuthenticatorSelection.RequireResidentKey)
+		assert.Equal(t, protocol.ResidentKeyRequirementDiscouraged, c.AuthenticatorSelection.ResidentKey)
+		assert.Equal(t, protocol.VerificationRequired, c.AuthenticatorSelection.UserVerification)
+		assert.Equal(t, protocol.PreferDirectAttestation, c.AttestationPreference)
+		assert.Equal(t, 30*time.Second, c.Timeouts.Registration.Timeout)
+		assert.Equal(t, 30*time.Second, c.Timeouts.Registration.TimeoutUVD)
+		assert.Equal(t, 45*time.Second, c.Timeouts.Login.Timeout)
+		assert.Equal(t, 45*time.Second, c.Timeouts.Login.TimeoutUVD)
+	})
+}
+
 func TestCourierTemplatesConfig(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1423,6 +1469,67 @@ func TestCleanup(t *testing.T) {
 		assert.Equal(t, p.DatabaseCleanupBatchSize(ctx), 100)
 		p.MustSet(ctx, config.ViperKeyDatabaseCleanupBatchSize, "1")
 		assert.Equal(t, p.DatabaseCleanupBatchSize(ctx), 1)
+	})
+}
+
+func TestOrganizationConfigSessionLifespan(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	orgID := uuid.Must(uuid.NewV4())
+	conf := config.MustNew(t, logrusx.New("", ""), &contextx.Default{},
+		configx.WithValues(map[string]interface{}{
+			"selfservice.methods.b2b.config.organizations": []map[string]interface{}{
+				{
+					"id":               orgID.String(),
+					"domains":          []string{"example.com"},
+					"session_lifespan": "2h",
+				},
+			},
+		}),
+		configx.SkipValidation(),
+	)
+
+	orgs := conf.Organizations(ctx)
+	require.Len(t, orgs, 1)
+	assert.Equal(t, orgID, orgs[0].ID)
+	assert.Equal(t, 2*time.Hour, orgs[0].SessionLifespan)
+}
+
+func TestConfigOrganizationSessionLifespan(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	orgWithOverride := uuid.Must(uuid.NewV4())
+	orgWithoutOverride := uuid.Must(uuid.NewV4())
+
+	conf := config.MustNew(t, logrusx.New("", ""), &contextx.Default{},
+		configx.WithValues(map[string]interface{}{
+			"session.lifespan": "24h",
+			"selfservice.methods.b2b.config.organizations": []map[string]interface{}{
+				{"id": orgWithOverride.String(), "domains": []string{"a.com"}, "session_lifespan": "1h"},
+				{"id": orgWithoutOverride.String(), "domains": []string{"b.com"}},
+			},
+		}),
+		configx.SkipValidation(),
+	)
+
+	t.Run("case=nil orgID returns project default", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, 24*time.Hour, conf.OrganizationSessionLifespan(ctx, uuid.Nil))
+	})
+
+	t.Run("case=org with override returns override", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, 1*time.Hour, conf.OrganizationSessionLifespan(ctx, orgWithOverride))
+	})
+
+	t.Run("case=org without override returns project default", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, 24*time.Hour, conf.OrganizationSessionLifespan(ctx, orgWithoutOverride))
+	})
+
+	t.Run("case=unknown orgID returns project default", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, 24*time.Hour, conf.OrganizationSessionLifespan(ctx, uuid.Must(uuid.NewV4())))
 	})
 }
 

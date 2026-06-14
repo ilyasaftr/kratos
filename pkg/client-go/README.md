@@ -93,6 +93,7 @@ Class | Method | HTTP request | Description
 *FrontendAPI* | [**CreateNativeRegistrationFlow**](docs/FrontendAPI.md#createnativeregistrationflow) | **Get** /self-service/registration/api | Create Registration Flow for Native Apps
 *FrontendAPI* | [**CreateNativeSettingsFlow**](docs/FrontendAPI.md#createnativesettingsflow) | **Get** /self-service/settings/api | Create Settings Flow for Native Apps
 *FrontendAPI* | [**CreateNativeVerificationFlow**](docs/FrontendAPI.md#createnativeverificationflow) | **Get** /self-service/verification/api | Create Verification Flow for Native Apps
+*FrontendAPI* | [**DeleteTestLoginFlow**](docs/FrontendAPI.md#deletetestloginflow) | **Delete** /self-service/login/test | Delete a test OIDC login flow
 *FrontendAPI* | [**DisableMyOtherSessions**](docs/FrontendAPI.md#disablemyothersessions) | **Delete** /sessions | Disable my other sessions
 *FrontendAPI* | [**DisableMySession**](docs/FrontendAPI.md#disablemysession) | **Delete** /sessions/{id} | Disable one of my sessions
 *FrontendAPI* | [**ExchangeSessionToken**](docs/FrontendAPI.md#exchangesessiontoken) | **Get** /sessions/token-exchange | Exchange Session Token
@@ -117,6 +118,7 @@ Class | Method | HTTP request | Description
 *IdentityAPI* | [**CreateIdentity**](docs/IdentityAPI.md#createidentity) | **Post** /admin/identities | Create an Identity
 *IdentityAPI* | [**CreateRecoveryCodeForIdentity**](docs/IdentityAPI.md#createrecoverycodeforidentity) | **Post** /admin/recovery/code | Create a Recovery Code
 *IdentityAPI* | [**CreateRecoveryLinkForIdentity**](docs/IdentityAPI.md#createrecoverylinkforidentity) | **Post** /admin/recovery/link | Create a Recovery Link
+*IdentityAPI* | [**CreateTestLoginFlow**](docs/IdentityAPI.md#createtestloginflow) | **Post** /admin/test-login-flows | Create a test OIDC login flow
 *IdentityAPI* | [**DeleteIdentity**](docs/IdentityAPI.md#deleteidentity) | **Delete** /admin/identities/{id} | Delete an Identity
 *IdentityAPI* | [**DeleteIdentityCredentials**](docs/IdentityAPI.md#deleteidentitycredentials) | **Delete** /admin/identities/{id}/credentials/{type} | Delete a credential for a specific identity
 *IdentityAPI* | [**DeleteIdentitySessions**](docs/IdentityAPI.md#deleteidentitysessions) | **Delete** /admin/identities/{id}/sessions | Delete &amp; Invalidate an Identity&#39;s Sessions
@@ -130,6 +132,7 @@ Class | Method | HTTP request | Description
 *IdentityAPI* | [**ListIdentitySchemas**](docs/IdentityAPI.md#listidentityschemas) | **Get** /schemas | Get all Identity Schemas
 *IdentityAPI* | [**ListIdentitySessions**](docs/IdentityAPI.md#listidentitysessions) | **Get** /admin/identities/{id}/sessions | List an Identity&#39;s Sessions
 *IdentityAPI* | [**ListSessions**](docs/IdentityAPI.md#listsessions) | **Get** /admin/sessions | List All Sessions
+*IdentityAPI* | [**ManageSessions**](docs/IdentityAPI.md#managesessions) | **Post** /admin/sessions | Manage sessions in bulk
 *IdentityAPI* | [**PatchIdentity**](docs/IdentityAPI.md#patchidentity) | **Patch** /admin/identities/{id} | Patch an Identity
 *IdentityAPI* | [**UpdateIdentity**](docs/IdentityAPI.md#updateidentity) | **Put** /admin/identities/{id} | Update an Identity
 *MetadataAPI* | [**GetVersion**](docs/MetadataAPI.md#getversion) | **Get** /version | Return Running Software Version.
@@ -159,7 +162,14 @@ Class | Method | HTTP request | Description
  - [CreateIdentityBody](docs/CreateIdentityBody.md)
  - [CreateRecoveryCodeForIdentityBody](docs/CreateRecoveryCodeForIdentityBody.md)
  - [CreateRecoveryLinkForIdentityBody](docs/CreateRecoveryLinkForIdentityBody.md)
+ - [CreateTestLoginFlowBody](docs/CreateTestLoginFlowBody.md)
  - [DeleteMySessionsCount](docs/DeleteMySessionsCount.md)
+ - [DeviceAuthnAndroidAuthorizationList](docs/DeviceAuthnAndroidAuthorizationList.md)
+ - [DeviceAuthnAndroidKeyDescription](docs/DeviceAuthnAndroidKeyDescription.md)
+ - [DeviceAuthnAndroidRootOfTrust](docs/DeviceAuthnAndroidRootOfTrust.md)
+ - [DeviceAuthnAttestation](docs/DeviceAuthnAttestation.md)
+ - [DeviceAuthnIOSAttStmt](docs/DeviceAuthnIOSAttStmt.md)
+ - [DeviceAuthnIOSAttestation](docs/DeviceAuthnIOSAttestation.md)
  - [DeviceAuthnKey](docs/DeviceAuthnKey.md)
  - [ErrorAuthenticatorAssuranceLevelNotSatisfied](docs/ErrorAuthenticatorAssuranceLevelNotSatisfied.md)
  - [ErrorBrowserLocationChangeRequired](docs/ErrorBrowserLocationChangeRequired.md)
@@ -205,7 +215,13 @@ Class | Method | HTTP request | Description
  - [JsonPatch](docs/JsonPatch.md)
  - [LoginFlow](docs/LoginFlow.md)
  - [LoginFlowState](docs/LoginFlowState.md)
+ - [LoginFlowTestContext](docs/LoginFlowTestContext.md)
+ - [LoginFlowTestDebugPayload](docs/LoginFlowTestDebugPayload.md)
+ - [LoginFlowTestSchemaValidationError](docs/LoginFlowTestSchemaValidationError.md)
+ - [LoginFlowTestStepError](docs/LoginFlowTestStepError.md)
  - [LogoutFlow](docs/LogoutFlow.md)
+ - [ManageSessionsBody](docs/ManageSessionsBody.md)
+ - [ManageSessionsResponse](docs/ManageSessionsResponse.md)
  - [Message](docs/Message.md)
  - [MessageDispatch](docs/MessageDispatch.md)
  - [NeedsPrivilegedSessionError](docs/NeedsPrivilegedSessionError.md)

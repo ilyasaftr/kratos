@@ -177,7 +177,7 @@ func (s *ManagerHTTP) IssueCookie(ctx context.Context, w http.ResponseWriter, r 
 	cookie.Options.MaxAge = 0
 	if s.r.Config().SessionPersistentCookie(ctx) {
 		if session.ExpiresAt.IsZero() {
-			cookie.Options.MaxAge = int(s.r.Config().SessionLifespan(ctx).Seconds())
+			cookie.Options.MaxAge = int(s.r.Config().OrganizationSessionLifespan(ctx, session.OrganizationID()).Seconds())
 		} else {
 			cookie.Options.MaxAge = int(time.Until(session.ExpiresAt).Seconds())
 		}
@@ -235,7 +235,7 @@ func (s *ManagerHTTP) extractToken(r *http.Request) string {
 
 func (s *ManagerHTTP) FetchFromRequestContext(ctx context.Context, r *http.Request) (_ *Session, err error) {
 	ctx, span := s.r.Tracer(ctx).Tracer().Start(ctx, "sessions.ManagerHTTP.FetchFromRequestContext")
-	otelx.End(span, &err)
+	defer otelx.End(span, &err)
 
 	if sess, ok := ctx.Value(sessionInContextKey).(*Session); ok {
 		return sess, nil
@@ -478,7 +478,7 @@ func (s *ManagerHTTP) ActivateSession(r *http.Request, session *Session, i *iden
 
 	session.Active = true
 	session.IssuedAt = authenticatedAt
-	session.ExpiresAt = authenticatedAt.Add(s.r.Config().SessionLifespan(ctx))
+	session.ExpiresAt = authenticatedAt.Add(s.r.Config().OrganizationSessionLifespan(ctx, session.OrganizationID()))
 	session.AuthenticatedAt = authenticatedAt
 
 	session.SetSessionDeviceInformation(r.WithContext(ctx))

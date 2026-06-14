@@ -6,9 +6,11 @@ package identity_test
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
+	"github.com/ory/herodot"
 	"github.com/ory/x/configx"
 	"github.com/ory/x/sqlcon"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ory/kratos/courier"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/pkg"
@@ -429,6 +432,47 @@ func TestManager(t *testing.T) {
 			require.NoError(t, reg.IdentityManager().Update(t.Context(), original, identity.ManagerAllowWriteProtectedTraits))
 
 			checkExtensionFieldsForIdentities(t, "bar@ory.sh", original)
+		})
+
+		t.Run("case=should reject credentials whose type does not match the map key", func(t *testing.T) {
+			// Safeguards the invariant from any caller that bypasses
+			// Identity.SetCredentials and writes to i.Credentials directly.
+			// The PATCH /admin/identities/{id} handler already enforces
+			// this; the Manager check is defense in depth.
+			email := uuid.Must(uuid.NewV4()).String() + "@ory.sh"
+			original := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+			original.Traits = newTraits(email, "")
+			original.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+				Type:        identity.CredentialsTypePassword,
+				Identifiers: []string{email},
+				Config:      sqlxx.JSONRawMessage(`{"hashed_password":"$2a$08$.cOYmAd.vCpDOoiVJrO5B.hjTLKQQ6cAK40u8uB.FnZDyPvVvQ9Q."}`),
+			})
+			require.NoError(t, reg.IdentityManager().Create(t.Context(), original))
+
+			// Bypass SetCredentials and write a malformed entry whose
+			// Type does not match the map key. This is what the patch
+			// handler effectively does when it decodes a JSON Patch
+			// straight into the Credentials map.
+			original.Credentials[identity.CredentialsTypePassword] = identity.Credentials{
+				Type:        "",
+				Identifiers: []string{email},
+				Config:      sqlxx.JSONRawMessage(`{}`),
+			}
+
+			err := reg.IdentityManager().Update(t.Context(), original, identity.ManagerAllowWriteProtectedTraits)
+			require.Error(t, err)
+			var herr *herodot.DefaultError
+			require.True(t, errors.As(err, &herr), "expected *herodot.DefaultError, got %T: %v", err, err)
+			assert.Equal(t, http.StatusBadRequest, herr.CodeField)
+			assert.Equal(t, `credentials.password.type must equal "password", got ""`, herr.Reason())
+
+			// Confirm the persisted credential row is byte-identical.
+			reloaded, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), original.ID)
+			require.NoError(t, err)
+			cred := reloaded.Credentials[identity.CredentialsTypePassword]
+			assert.Equal(t, identity.CredentialsTypePassword, cred.Type)
+			assert.Equal(t, []string{email}, cred.Identifiers)
+			assert.JSONEq(t, `{"hashed_password":"$2a$08$.cOYmAd.vCpDOoiVJrO5B.hjTLKQQ6cAK40u8uB.FnZDyPvVvQ9Q."}`, string(cred.Config))
 		})
 
 		t.Run("case=should set AAL to 1 if password is set", func(t *testing.T) {
@@ -848,5 +892,76 @@ func TestManagerNoDefaultNamedSchema(t *testing.T) {
 			StateChangedAt: &stateChangedAt,
 		}
 		require.NoError(t, reg.IdentityManager().Create(t.Context(), original))
+	})
+}
+
+func TestManager_SendVerifiableAddressChangedNotifications(t *testing.T) {
+	_, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(map[string]interface{}{
+			config.ViperKeyCourierSMTPURL:          "smtp://foo@bar@dev.null/",
+			config.ViperKeyDefaultIdentitySchemaID: "default",
+		}),
+		configx.WithValues(testhelpers.IdentitySchemasConfig(map[string]string{
+			"default": "file://./stub/manager.schema.json",
+		})),
+	)
+
+	t.Run("case=queues email and sms for supported targets", func(t *testing.T) {
+		ctx := t.Context()
+		i := identity.NewIdentity("default")
+		i.Traits = identity.Traits(`{"email":"new@example.com"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, i))
+
+		targets := []identity.AddressRef{
+			{Value: "old@example.com", Via: identity.AddressTypeEmail},
+			{Value: "+15551234567", Via: identity.AddressTypeSMS},
+		}
+
+		require.NoError(t, reg.IdentityManager().SendVerifiableAddressChangedNotifications(ctx, targets, i))
+
+		messages, err := reg.CourierPersister().NextMessages(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, messages, 2)
+
+		var gotEmail, gotSMS bool
+		for _, m := range messages {
+			switch m.Type {
+			case courier.MessageTypeEmail:
+				assert.Equal(t, "old@example.com", m.Recipient)
+				gotEmail = true
+			case courier.MessageTypeSMS:
+				assert.Equal(t, "+15551234567", m.Recipient)
+				gotSMS = true
+			}
+		}
+		assert.True(t, gotEmail, "expected an email message")
+		assert.True(t, gotSMS, "expected an SMS message")
+	})
+
+	t.Run("case=unsupported Via skipped", func(t *testing.T) {
+		ctx := t.Context()
+		i := identity.NewIdentity("default")
+		i.Traits = identity.Traits(`{"email":"skip@example.com"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, i))
+
+		require.NoError(t, reg.IdentityManager().SendVerifiableAddressChangedNotifications(ctx, []identity.AddressRef{
+			{Value: "fax:+123", Via: "fax"},
+		}, i))
+
+		messages, err := reg.CourierPersister().NextMessages(ctx, 10)
+		if err == nil {
+			for _, m := range messages {
+				assert.NotEqual(t, "fax:+123", m.Recipient, "fax target must not be queued")
+			}
+		}
+	})
+
+	t.Run("case=empty targets is noop", func(t *testing.T) {
+		ctx := t.Context()
+		i := identity.NewIdentity("default")
+		i.Traits = identity.Traits(`{"email":"noop@example.com"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, i))
+
+		require.NoError(t, reg.IdentityManager().SendVerifiableAddressChangedNotifications(ctx, nil, i))
 	})
 }

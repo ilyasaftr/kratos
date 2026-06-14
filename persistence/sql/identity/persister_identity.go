@@ -18,7 +18,6 @@ import (
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3"
@@ -398,6 +397,23 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, ident
 			cred.IdentityID = ident.ID
 			cred.NID = nid
 			cred.IdentityCredentialTypeID = ct
+
+			// TOTP and lookup-secret AAL2 logins resolve the credential by
+			// joining identity_credential_identifiers, using the identity ID
+			// as the identifier (see selfservice/strategy/{totp,lookup}/
+			// login.go and settings.go). The admin import path does not
+			// provide an identifier, and at import time the identity ID may
+			// still be the zero value (CockroachDB assigns it via
+			// gen_random_uuid() during the identity insert). At this point
+			// ident.ID is the persisted identity ID, so default the
+			// identifier here to keep AAL2 login working for imported
+			// credentials. See https://github.com/ory/kratos/issues/4561.
+			if len(cred.Identifiers) == 0 &&
+				(cred.Type == identity.CredentialsTypeTOTP ||
+					cred.Type == identity.CredentialsTypeLookup) {
+				cred.Identifiers = []string{ident.ID.String()}
+			}
+
 			credentials = append(credentials, &cred)
 
 			ident.Credentials[k] = cred
@@ -700,15 +716,17 @@ func (p *IdentityPersister) CreateIdentity(ctx context.Context, ident *identity.
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
 
-	return p.CreateIdentities(ctx, ident)
+	return p.CreateIdentities(ctx, []*identity.Identity{ident})
 }
 
-func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...*identity.Identity) (err error) {
+func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities []*identity.Identity, opts ...identity.CreateIdentitiesModifier) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.CreateIdentities",
 		trace.WithAttributes(
 			attribute.Int("identities.count", len(identities)),
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
+
+	options := identity.NewCreateIdentitiesOptions(opts)
 
 	for _, ident := range identities {
 		ident.NID = p.NetworkID(ctx)
@@ -749,11 +767,14 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 		partialErr = nil
 		createdIdentities := make([]*identity.Identity, 0, len(identities))
 
-		var opts []batch.CreateOpts
-		if len(identities) > 1 {
-			opts = append(opts, batch.WithPartialInserts)
+		var batchOpts []batch.CreateOpts
+		if extras := options.ExtraColumns; len(extras) > 0 {
+			batchOpts = append(batchOpts, batch.WithExtraColumns(extras))
 		}
-		if err := batch.Create(ctx, conn, identities, opts...); err != nil {
+		if len(identities) > 1 {
+			batchOpts = append(batchOpts, batch.WithPartialInserts)
+		}
+		if err := batch.Create(ctx, conn, identities, batchOpts...); err != nil {
 			if partialErr := new(batch.PartialConflictError[identity.Identity]); errors.As(err, &partialErr) {
 				for _, k := range partialErr.Failed {
 					failedIdentityIDs[k.ID] = struct{ created bool }{false}
@@ -866,58 +887,32 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 
 	nid := p.NetworkID(ctx)
 
-	eg, ctx := errgroup.WithContext(ctx)
 	if expand.Has(identity.ExpandFieldRecoveryAddresses) {
-		eg.Go(func() error {
-			// We use WithContext to get a copy of the connection struct, which solves the race detector
-			// from complaining incorrectly.
-			//
-			// https://github.com/ory/pop/issues/723
-			if err := p.GetConnection(ctx).WithContext(ctx).
-				Where("identity_id = ? AND nid = ?", i.ID, nid).
-				Order("id ASC").
-				All(&i.RecoveryAddresses); err != nil {
-				return sqlcon.HandleError(err)
-			}
-			return nil
-		})
+		if err := p.GetConnection(ctx).
+			Where("identity_id = ? AND nid = ?", i.ID, nid).
+			Order("id ASC").
+			All(&i.RecoveryAddresses); err != nil {
+			return sqlcon.HandleError(err)
+		}
 	}
 
 	if expand.Has(identity.ExpandFieldVerifiableAddresses) {
-		eg.Go(func() error {
-			// We use WithContext to get a copy of the connection struct, which solves the race detector
-			// from complaining incorrectly.
-			//
-			// https://github.com/ory/pop/issues/723
-			if err := p.GetConnection(ctx).WithContext(ctx).
-				Order("id ASC").
-				Where("identity_id = ? AND nid = ?", i.ID, nid).
-				All(&i.VerifiableAddresses); err != nil {
-				return sqlcon.HandleError(err)
-			}
-			return nil
-		})
+		if err := p.GetConnection(ctx).
+			Order("id ASC").
+			Where("identity_id = ? AND nid = ?", i.ID, nid).
+			All(&i.VerifiableAddresses); err != nil {
+			return sqlcon.HandleError(err)
+		}
 	}
 
 	if expand.Has(identity.ExpandFieldCredentials) {
-		eg.Go(func() (err error) {
-			// We use WithContext to get a copy of the connection struct, which solves the race detector
-			// from complaining incorrectly.
-			//
-			// https://github.com/ory/pop/issues/723
-			creds, err := QueryForCredentials(p.GetConnection(ctx).WithContext(ctx),
-				Where{"identity_credentials.identity_id = ?", []interface{}{i.ID}},
-				Where{"identity_credentials.nid = ?", []interface{}{nid}})
-			if err != nil {
-				return err
-			}
-			i.Credentials = creds[i.ID]
-			return
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		return err
+		creds, err := QueryForCredentials(p.GetConnection(ctx),
+			Where{"identity_credentials.identity_id = ?", []interface{}{i.ID}},
+			Where{"identity_credentials.nid = ?", []interface{}{nid}})
+		if err != nil {
+			return err
+		}
+		i.Credentials = creds[i.ID]
 	}
 
 	if err := i.Validate(); err != nil {
@@ -1057,6 +1052,10 @@ func (p *IdentityPersister) getCredentialTypeIDs(ctx context.Context, credential
 }
 
 func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.ListIdentityParameters) (_ []identity.Identity, nextPage *keysetpagination.Paginator, err error) {
+	if (params.ColumnsTransformer == nil) != (params.RowScanner == nil) {
+		return nil, nil, errors.New("ListIdentityParameters: ColumnsTransformer and RowScanner must be set together")
+	}
+
 	paginator := keysetpagination.GetPaginator(append(
 		params.KeySetPagination,
 		keysetpagination.WithDefaultToken(identity.DefaultPageToken()),
@@ -1152,6 +1151,9 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 		}
 
 		columns := popx.DBColumns[identity.Identity](&popx.AliasQuoter{Alias: "identities", Quoter: con.Dialect})
+		if params.ColumnsTransformer != nil {
+			columns = params.ColumnsTransformer(columns)
+		}
 
 		query := fmt.Sprintf(`
 		SELECT DISTINCT %s
@@ -1164,7 +1166,12 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 			columns,
 			joins, wheres, limit)
 
-		if err := con.RawQuery(query, args...).All(&is); err != nil {
+		if params.RowScanner != nil {
+			is, err = params.RowScanner(con, query, args)
+			if err != nil {
+				return sqlcon.HandleError(err)
+			}
+		} else if err := con.RawQuery(query, args...).All(&is); err != nil {
 			return sqlcon.HandleError(err)
 		}
 

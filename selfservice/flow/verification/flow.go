@@ -10,6 +10,9 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
 	"github.com/ory/kratos/x/redir"
 
 	"github.com/ory/pop/v6"
@@ -22,6 +25,7 @@ import (
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -58,6 +62,9 @@ type Flow struct {
 	// RequestURL is the initial URL that was requested from Ory Kratos. It can be used
 	// to forward information contained in the URL's path or query for example.
 	RequestURL string `json:"request_url" db:"request_url"`
+
+	// InternalContext stores internal-only data for this flow.
+	InternalContext sqlxx.JSONRawMessage `db:"internal_context" json:"-" faker:"-"`
 
 	// ReturnTo contains the requested return_to URL.
 	ReturnTo string `json:"return_to,omitempty" db:"-"`
@@ -113,8 +120,18 @@ type OAuth2LoginChallengeParams struct {
 
 var _ flow.Flow = (*Flow)(nil)
 
-func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, ft flow.Type) (*Flow, error) {
-	now := time.Now().UTC()
+// flowDependencies are the dependencies NewFlow needs to construct a
+// verification flow: the configuration (for return-to validation) and the
+// clock. The lifespan and CSRF token are passed explicitly because callers
+// vary them (regenerated CSRF tokens, conditional tokens by flow type).
+type flowDependencies interface {
+	config.Provider
+	clock.Provider
+}
+
+func NewFlow(reg flowDependencies, exp time.Duration, csrf string, r *http.Request, strategies Strategies, ft flow.Type) (*Flow, error) {
+	conf := reg.Config()
+	now := reg.Clock().Now().UTC()
 	id := x.NewUUID()
 
 	// Pre-validate the return to URL which is contained in the HTTP request.
@@ -142,6 +159,9 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 		State:     flow.StateChooseMethod,
 		Type:      ft,
 	}
+	if err := f.setCourierBaseURL(x.BaseURLStringFromContext(r.Context())); err != nil {
+		return nil, err
+	}
 
 	for _, strategy := range strategies {
 		if ps, isPrimary := strategy.(PrimaryStrategy); isPrimary {
@@ -155,13 +175,13 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 	return f, nil
 }
 
-func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, of *Flow) (*Flow, error) {
+func FromOldFlow(reg flowDependencies, exp time.Duration, csrf string, r *http.Request, strategies Strategies, of *Flow) (*Flow, error) {
 	f := of.Type
 	// Using the same flow in the recovery/verification context can lead to using API flow in a verification/recovery email
 	if of.Type == flow.TypeAPI {
 		f = flow.TypeBrowser
 	}
-	nf, err := NewFlow(conf, exp, csrf, r, strategies, f)
+	nf, err := NewFlow(reg, exp, csrf, r, strategies, f)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +190,8 @@ func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Re
 	return nf, nil
 }
 
-func NewPostHookFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, original flow.Flow) (*Flow, error) {
-	f, err := NewFlow(conf, exp, csrf, r, strategies, original.GetType())
+func NewPostHookFlow(reg flowDependencies, exp time.Duration, csrf string, r *http.Request, strategies Strategies, original flow.Flow) (*Flow, error) {
+	f, err := NewFlow(reg, exp, csrf, r, strategies, original.GetType())
 	if err != nil {
 		return nil, err
 	}
@@ -205,10 +225,49 @@ func (f *Flow) SetState(state State)                      { f.State = state }
 func (f *Flow) GetTransientPayload() json.RawMessage      { return f.TransientPayload }
 func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString { return f.OAuth2LoginChallenge }
 func (f *Flow) GetUI() *container.Container               { return f.UI }
+func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage  { return f.InternalContext }
+func (f *Flow) SetInternalContext(c sqlxx.JSONRawMessage) { f.InternalContext = c }
 
-func (f *Flow) Valid() error {
-	if f.ExpiresAt.Before(time.Now()) {
-		return errors.WithStack(flow.NewFlowExpiredError(f.ExpiresAt))
+// EnsureInternalContext initializes InternalContext to an empty JSON object
+// if it is missing or not valid JSON. Mirrors the registration / settings /
+// login flow implementations.
+func (f *Flow) EnsureInternalContext() {
+	if !gjson.ValidBytes(f.InternalContext) {
+		f.InternalContext = []byte("{}")
+	}
+}
+
+// GetCourierBaseURL returns the base URL captured at flow init from the
+// request context, or the empty string when nothing was captured (the email
+// senders then fall back to Config.SelfPublicURL).
+func (f *Flow) GetCourierBaseURL() string {
+	return gjson.GetBytes(f.InternalContext, flow.InternalContextKeyCourierBaseURL).String()
+}
+
+// setCourierBaseURL writes the captured base URL into InternalContext under
+// the well-known key. Empty input is a no-op (preserves the fall-back
+// path). Inputs longer than 8192 bytes are rejected — the same implicit
+// ceiling the dedicated VARCHAR(8192) column used to enforce — so a
+// pathological header cannot bloat the row.
+func (f *Flow) setCourierBaseURL(s string) error {
+	if s == "" {
+		return nil
+	}
+	if len(s) > 8192 {
+		return nil
+	}
+	f.EnsureInternalContext()
+	out, err := sjson.SetBytes(f.InternalContext, flow.InternalContextKeyCourierBaseURL, s)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	f.InternalContext = out
+	return nil
+}
+
+func (f *Flow) Valid(c clock.Clock) error {
+	if f.ExpiresAt.Before(c.Now()) {
+		return errors.WithStack(flow.NewFlowExpiredError(c, f.ExpiresAt))
 	}
 	return nil
 }

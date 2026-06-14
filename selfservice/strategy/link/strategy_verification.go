@@ -17,6 +17,7 @@ import (
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/flow"
+	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/selfservice/flow/verification"
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/container"
@@ -146,7 +147,7 @@ func (s *Strategy) Verify(w http.ResponseWriter, r *http.Request, f *verificatio
 		return s.handleVerificationError(r, f, body, err)
 	}
 
-	if err := f.Valid(); err != nil {
+	if err := f.Valid(s.d.Clock()); err != nil {
 		return s.handleVerificationError(r, f, body, err)
 	}
 
@@ -207,15 +208,15 @@ func (s *Strategy) verificationUseToken(ctx context.Context, w http.ResponseWrit
 		return s.retryVerificationFlowWithError(ctx, w, r, flow.TypeBrowser, err)
 	}
 
-	if err := token.Valid(); err != nil {
+	if err := token.Valid(s.d.Clock()); err != nil {
 		return s.retryVerificationFlowWithError(ctx, w, r, flow.TypeBrowser, err)
 	}
 
 	var identityID uuid.UUID
 	var addressVia string
+	var ptcIdentity *identity.Identity
 
 	if token.VerifiableAddress == nil {
-		// Pending-change path: no persisted address — look up by verification flow ID.
 		ptc, ptcErr := s.d.PendingTraitsChangePersister().GetPendingTraitsChangeByVerificationFlow(ctx, f.ID)
 		if ptcErr != nil {
 			if errors.Is(ptcErr, sqlcon.ErrNoRows()) {
@@ -224,8 +225,10 @@ func (s *Strategy) verificationUseToken(ctx context.Context, w http.ResponseWrit
 			return s.retryVerificationFlowWithError(ctx, w, r, f.Type, ptcErr)
 		}
 
-		if err := s.d.IdentityManager().ApplyPendingTraitsChange(ctx, ptc); err != nil {
-			if errors.Is(err, identity.ErrConcurrentModification) {
+		updatedIdentity, applyErr := s.d.SettingsHookExecutor().ApplyPendingTraitsChange(ctx, w, r, ptc)
+		if applyErr != nil {
+			if errors.Is(applyErr, identity.ErrConcurrentModification) ||
+				errors.Is(applyErr, settings.ErrPendingTraitsChangeSessionInvalid) {
 				f.UI.Messages.Clear()
 				f.UI.Messages.Add(text.NewErrorValidationVerificationTokenInvalidOrAlreadyUsed())
 				if err := s.d.VerificationFlowPersister().UpdateVerificationFlow(ctx, f); err != nil {
@@ -238,9 +241,10 @@ func (s *Strategy) verificationUseToken(ctx context.Context, w http.ResponseWrit
 				}
 				return errors.WithStack(flow.ErrCompletedByStrategy)
 			}
-			return s.retryVerificationFlowWithError(ctx, w, r, f.Type, err)
+			return s.retryVerificationFlowWithError(ctx, w, r, f.Type, applyErr)
 		}
 
+		ptcIdentity = updatedIdentity
 		addressVia = ptc.NewAddressVia
 		identityID = ptc.IdentityID
 	} else {
@@ -258,9 +262,14 @@ func (s *Strategy) verificationUseToken(ctx context.Context, w http.ResponseWrit
 		identityID = address.IdentityID
 	}
 
-	i, err := s.d.IdentityPool().GetIdentity(ctx, identityID, identity.ExpandDefault)
-	if err != nil {
-		return s.retryVerificationFlowWithError(ctx, w, r, flow.TypeBrowser, err)
+	var i *identity.Identity
+	if ptcIdentity != nil {
+		i = ptcIdentity
+	} else {
+		i, err = s.d.IdentityPool().GetIdentity(ctx, identityID, identity.ExpandDefault)
+		if err != nil {
+			return s.retryVerificationFlowWithError(ctx, w, r, flow.TypeBrowser, err)
+		}
 	}
 
 	// Remainder is shared between both paths.
@@ -296,7 +305,7 @@ func (s *Strategy) verificationUseToken(ctx context.Context, w http.ResponseWrit
 func (s *Strategy) retryVerificationFlowWithMessage(ctx context.Context, w http.ResponseWriter, r *http.Request, ft flow.Type, message *text.Message) error {
 	s.d.Logger().WithRequest(r).WithField("message", message).Debug("A verification flow is being retried because a validation error occurred.")
 
-	f, err := verification.NewFlow(s.d.Config(),
+	f, err := verification.NewFlow(s.d,
 		s.d.Config().SelfServiceFlowVerificationRequestLifespan(ctx), s.d.CSRFHandler().RegenerateToken(w, r), r, verification.Strategies{s}, ft)
 	if err != nil {
 		return s.handleVerificationError(r, f, nil, err)
@@ -320,14 +329,14 @@ func (s *Strategy) retryVerificationFlowWithMessage(ctx context.Context, w http.
 func (s *Strategy) retryVerificationFlowWithError(ctx context.Context, w http.ResponseWriter, r *http.Request, ft flow.Type, verErr error) error {
 	s.d.Logger().WithRequest(r).WithError(verErr).Debug("A verification flow is being retried because an error occurred.")
 
-	f, err := verification.NewFlow(s.d.Config(),
+	f, err := verification.NewFlow(s.d,
 		s.d.Config().SelfServiceFlowVerificationRequestLifespan(ctx), s.d.CSRFHandler().RegenerateToken(w, r), r, verification.Strategies{s}, ft)
 	if err != nil {
 		return s.handleVerificationError(r, f, nil, err)
 	}
 
 	if expired := new(flow.ExpiredError); errors.As(verErr, &expired) {
-		return s.retryVerificationFlowWithMessage(ctx, w, r, ft, text.NewErrorValidationVerificationFlowExpired(expired.ExpiredAt))
+		return s.retryVerificationFlowWithMessage(ctx, w, r, ft, text.NewErrorValidationVerificationFlowExpired(s.d.Clock(), expired.ExpiredAt))
 	} else {
 		if err := f.UI.ParseError(node.LinkGroup, verErr); err != nil {
 			return err

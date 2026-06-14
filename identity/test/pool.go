@@ -127,6 +127,11 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				assertion := func(t *testing.T, actual *identity.Identity) {
 					assertx.EqualAsJSONExcept(t, expected, actual, []string{
 						"verifiable_addresses", "recovery_addresses", "updated_at", "created_at", "credentials", "state_changed_at",
+						// region is hydrated by the multi-region persister from
+						// the row's crdb_region, but the OSS-side `expected`
+						// snapshot is built from the in-memory Identity which
+						// has Region empty when the test does not set it.
+						"region",
 					})
 					cb(t, actual)
 				}
@@ -243,6 +248,9 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				require.NoError(t, err)
 				assertx.EqualAsJSONExcept(t, expected, actual, []string{
 					"verifiable_addresses", "recovery_addresses", "updated_at", "created_at", "credentials", "state_changed_at",
+					// region is hydrated by the multi-region persister; the
+					// in-memory expected snapshot has Region empty.
+					"region",
 				})
 				require.Len(t, actual.Credentials, 2)
 
@@ -564,7 +572,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				for i := range identities {
 					identities[i] = NewTestIdentity(4, "persister-create-multiple", i)
 				}
-				require.NoError(t, p.CreateIdentities(ctx, identities...))
+				require.NoError(t, p.CreateIdentities(ctx, identities))
 				createdAt := time.Now().UTC()
 
 				for _, id := range identities {
@@ -597,7 +605,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				for i := range identities {
 					identities[i] = NewTestIdentity(4, "persister-create-multiple-2", i%60)
 				}
-				err := p.CreateIdentities(ctx, identities...)
+				err := p.CreateIdentities(ctx, identities)
 				if dbname == "mysql" {
 					// partial inserts are not supported on mysql
 					assert.ErrorIs(t, err, sqlcon.ErrUniqueViolation())
@@ -654,7 +662,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				first[i] = NewTestIdentity(1, "ext-id-conflict-first", i)
 				first[i].ExternalID = sqlxx.NullString(fmt.Sprintf("ext-conflict-pool-%d", i))
 			}
-			require.NoError(t, p.CreateIdentities(ctx, first...))
+			require.NoError(t, p.CreateIdentities(ctx, first))
 			for _, id := range first {
 				createdIDs = append(createdIDs, id.ID)
 			}
@@ -665,7 +673,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				second[i] = NewTestIdentity(1, "ext-id-conflict-second", i)
 				second[i].ExternalID = sqlxx.NullString(fmt.Sprintf("ext-conflict-pool-%d", i))
 			}
-			err := p.CreateIdentities(ctx, second...)
+			err := p.CreateIdentities(ctx, second)
 			if dbname == "mysql" {
 				assert.ErrorIs(t, err, sqlcon.ErrUniqueViolation())
 				return
@@ -754,6 +762,33 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				func(s string) string { return s[:1] + strings.ToUpper(s[1:2]) + s[2:] },
 				strings.ToUpper,
 				func(s string) string { left, right, _ := strings.Cut(s, "@"); return left + "@" + strings.Title(right) },
+				// Invisible Unicode characters (category Cf) must not let an
+				// attacker register a second visually-identical identifier.
+				func(s string) string { return "\u200B" + s }, // zero-width space prefix
+				func(s string) string { return s[:1] + "\u200C" + s[1:] },
+				func(s string) string { return s[:1] + "\u200D" + s[1:] },
+				func(s string) string { return s[:1] + "\u00AD" + s[1:] },
+				func(s string) string { return s[:1] + "\uFEFF" + s[1:] },
+				func(s string) string { return s[:1] + "\u2060" + s[1:] },
+				func(s string) string { return s[:1] + "\u180E" + s[1:] },
+				// NFKC compatibility decomposition must collapse fullwidth
+				// lookalikes into ASCII.
+				func(s string) string {
+					left, right, _ := strings.Cut(s, "@")
+					out := make([]rune, 0, len(left))
+					for _, r := range left {
+						if r >= 'a' && r <= 'z' {
+							out = append(out, 0xFF41+(r-'a'))
+							continue
+						}
+						if r >= '0' && r <= '9' {
+							out = append(out, 0xFF10+(r-'0'))
+							continue
+						}
+						out = append(out, r)
+					}
+					return string(out) + "@" + right
+				},
 			} {
 				ids := transform(email)
 				expected := passwordIdentity("", ids)
@@ -1103,7 +1138,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 
 					expected := expectedIdentities[c]
 					require.Len(t, actual, 1)
-					assertx.EqualAsJSONExcept(t, expected, actual[0], []string{"credentials.config", "created_at", "updated_at", "state_changed_at"})
+					assertx.EqualAsJSONExcept(t, expected, actual[0], []string{"credentials.config", "created_at", "updated_at", "state_changed_at", "region"})
 				})
 			}
 
@@ -1119,7 +1154,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				for _, e := range append(expectedIdentities[:2], create) {
 					for _, a := range actual {
 						if e.ID == a.ID {
-							assertx.EqualAsJSONExcept(t, e, a, []string{"credentials.config", "created_at", "updated_at", "state_changed_at"})
+							assertx.EqualAsJSONExcept(t, e, a, []string{"credentials.config", "created_at", "updated_at", "state_changed_at", "region"})
 							continue outer
 						}
 					}
@@ -1608,7 +1643,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 						actual, creds, err := p.FindByCredentialsIdentifier(ctx, ct, caseSensitive)
 						require.NoError(t, err)
 						assertx.EqualAsJSONExcept(t, expected.Credentials[ct], creds, []string{"created_at", "updated_at", "id"})
-						assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id"})
+						assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id", "region"})
 					})
 				}
 			})
@@ -1625,7 +1660,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 							ec := expected.Credentials[ct]
 							ec.Identifiers = []string{strings.ToLower(caseSensitive)}
 							assertx.EqualAsJSONExcept(t, ec, creds, []string{"created_at", "updated_at", "id", "config.user_handle", "config.credentials", "version"})
-							assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id"})
+							assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id", "region"})
 						}
 					})
 				}

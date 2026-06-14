@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"github.com/tidwall/sjson"
 
@@ -22,14 +23,17 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/sqlcon"
 )
 
 var _ settings.PostHookPrePersistExecutor = new(VerifyNewAddress)
 
 type (
 	verifyNewAddressDependencies interface {
+		clock.Provider
 		config.Provider
 		nosurfx.CSRFTokenGeneratorProvider
 		nosurfx.CSRFProvider
@@ -58,10 +62,10 @@ func NewVerifyNewAddress(r verifyNewAddressDependencies) *VerifyNewAddress {
 
 func (e *VerifyNewAddress) ExecuteSettingsPrePersistHook(
 	w http.ResponseWriter, r *http.Request,
-	f *settings.Flow, i *identity.Identity, s *session.Session,
+	params settings.PostHookPrePersistExecutorParams,
 ) error {
 	return otelx.WithSpan(r.Context(), "selfservice.hook.VerifyNewAddress.ExecuteSettingsPrePersistHook", func(ctx context.Context) error {
-		return e.execute(ctx, w, r, f, i, s)
+		return e.execute(ctx, w, r, params.Flow, params.Identity, params.Session)
 	})
 }
 
@@ -101,13 +105,32 @@ func (e *VerifyNewAddress) execute(
 		return errors.WithStack(settings.ErrHookAbortFlow)
 	}
 
+	// Process the first changed address (we can only redirect to one verification flow).
+	addr := changed[0]
+
+	// Reject if the new address already belongs to a different identity
+	existingAddr, err := e.r.PrivilegedIdentityPool().FindVerifiableAddressByValue(ctx, addr.Via, addr.Value)
+	if err != nil && !errors.Is(err, sqlcon.ErrNoRows()) {
+		return err
+	}
+	if err == nil && existingAddr.IdentityID != original.ID {
+		f.UI.Messages.Clear()
+		f.UI.Messages.Add(text.NewErrorValidationDuplicateCredentials())
+		if err := e.r.SettingsFlowPersister().UpdateSettingsFlow(ctx, f); err != nil {
+			return err
+		}
+		if x.IsJSONRequest(r) {
+			e.r.Writer().WriteCode(w, r, http.StatusBadRequest, f)
+			return errors.WithStack(settings.ErrHookAbortFlow)
+		}
+		http.Redirect(w, r, f.AppendTo(e.r.Config().SelfServiceFlowSettingsUI(ctx)).String(), http.StatusSeeOther)
+		return errors.WithStack(settings.ErrHookAbortFlow)
+	}
+
 	// Delete any existing pending changes for this identity.
 	if err := e.r.PendingTraitsChangePersister().DeletePendingTraitsChangesByIdentity(ctx, original.ID); err != nil {
 		return err
 	}
-
-	// Process the first changed address (we can only redirect to one verification flow).
-	addr := changed[0]
 
 	// Create the verification flow.
 	strategies, primaryStrategy, err := e.r.GetActiveVerificationStrategies(ctx)
@@ -120,7 +143,7 @@ func (e *VerifyNewAddress) execute(
 		csrf = e.r.GenerateCSRFToken(r)
 	}
 
-	verificationFlow, err := verification.NewPostHookFlow(e.r.Config(),
+	verificationFlow, err := verification.NewPostHookFlow(e.r,
 		e.r.Config().SelfServiceFlowVerificationRequestLifespan(ctx),
 		csrf, r, strategies, f)
 	if err != nil {
@@ -142,14 +165,18 @@ func (e *VerifyNewAddress) execute(
 	}
 
 	// Create PendingTraitsChange record.
+	sessionID := s.ID
+	originFlowID := f.ID
 	ptc := &identity.PendingTraitsChange{
-		IdentityID:         original.ID,
-		NewAddressValue:    addr.Value,
-		NewAddressVia:      addr.Via,
-		OriginalTraitsHash: identity.HashTraits(json.RawMessage(original.Traits)),
-		ProposedTraits:     json.RawMessage(proposed.Traits),
-		VerificationFlowID: verificationFlow.ID,
-		Status:             identity.PendingTraitsChangeStatusPending,
+		IdentityID:           original.ID,
+		SessionID:            uuid.NullUUID{UUID: sessionID, Valid: true},
+		OriginSettingsFlowID: uuid.NullUUID{UUID: originFlowID, Valid: true},
+		NewAddressValue:      addr.Value,
+		NewAddressVia:        addr.Via,
+		OriginalTraitsHash:   identity.HashTraits(json.RawMessage(original.Traits)),
+		ProposedTraits:       json.RawMessage(proposed.Traits),
+		VerificationFlowID:   verificationFlow.ID,
+		Status:               identity.PendingTraitsChangeStatusPending,
 	}
 	if err := e.r.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptc); err != nil {
 		return err

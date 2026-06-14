@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -341,7 +340,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 							Config:      sqlxx.JSONRawMessage(cf),
 						},
 					}
-					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i)) // We explicitly bypass identity validation to test the legacy code path
+					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i})) // We explicitly bypass identity validation to test the legacy code path
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s.identityEmail = email
 					return s
@@ -380,7 +379,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						identity.CredentialsTypePassword: {Type: identity.CredentialsTypePassword, Identifiers: []string{email}, Config: sqlxx.JSONRawMessage(`{}`)},
 					}
 
-					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i)) // We explicitly bypass identity validation to test the legacy code path
+					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i})) // We explicitly bypass identity validation to test the legacy code path
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s.identityEmail = email
 					run(t, s)
@@ -396,7 +395,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 					i.NID = x.NewUUID()
 					email := testhelpers.RandomEmail()
 					i.Traits = identity.Traits(fmt.Sprintf(`{"tos": true, "email": "%s"}`, email))
-					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i)) // We explicitly bypass identity validation to test the legacy code path
+					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i})) // We explicitly bypass identity validation to test the legacy code path
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s.identityEmail = email
 					// submit email
@@ -467,7 +466,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						Config:      sqlxx.JSONRawMessage(`{"address_type": "sms"}`),
 					},
 				}
-				require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i))
+				require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i}))
 				t.Cleanup(func() {
 					require.NoError(t, reg.PrivilegedIdentityPool().DeleteIdentity(ctx, i.ID))
 				})
@@ -881,7 +880,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.NoError(t, err)
 						require.Len(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 						require.Len(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-						require.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
+						require.EqualValues(t, text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 
 						s := &state{
 							flowID:        f.GetId(),
@@ -1170,7 +1169,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 					require.EqualValues(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
 					require.Len(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 					require.Len(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-					require.EqualValues(t, gjson.GetBytes(body, "ui.messages.0.id").Int(), text.InfoSelfServiceLoginCodeSent, "%s", body)
+					require.EqualValues(t, gjson.GetBytes(body, "ui.messages.0.id").Int(), text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, "%s", body)
 
 					snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptPaths("ui.nodes.5.attributes.value", "id", "created_at", "expires_at", "updated_at", "issued_at", "request_url", "ui.action"))
 				})
@@ -1220,7 +1219,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.EqualValues(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
 						require.Len(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 						require.Len(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-						require.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
+						require.EqualValues(t, text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 
 						snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptPaths("ui.nodes.5.attributes.value", "id", "created_at", "expires_at", "updated_at", "issued_at", "request_url", "ui.action"))
 					})
@@ -1244,7 +1243,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.EqualValuesf(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
 						require.Lenf(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 						require.Lenf(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-						require.EqualValuesf(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
+						require.EqualValuesf(t, text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 
 						snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptPaths("ui.nodes.5.attributes.value", "id", "created_at", "expires_at", "updated_at", "issued_at", "request_url", "ui.action"))
 					})
@@ -1324,7 +1323,7 @@ func TestFormHydration(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
 		r = r.WithContext(ctx)
-		f, err := login.NewFlow(reg.Config(), time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f, err := login.NewFlow(reg, r, flow.TypeBrowser)
 		require.NoError(t, err)
 		return r, f
 	}
@@ -1583,7 +1582,7 @@ func TestCodeLoginWithLoginChallenge(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
 		r = r.WithContext(ctx)
-		f, err := login.NewFlow(reg.Config(), time.Minute, nosurfx.FakeCSRFToken, r, flow.TypeBrowser)
+		f, err := login.NewFlow(reg, r, flow.TypeBrowser)
 		require.NoError(t, err)
 		require.NoError(t, reg.LoginFlowPersister().CreateLoginFlow(ctx, f))
 		return r, f

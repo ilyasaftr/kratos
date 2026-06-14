@@ -5,15 +5,22 @@ package settings
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
+
+	stderrors "errors"
 
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/sqlxx"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -24,8 +31,6 @@ import (
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/ui/node"
-
-	"github.com/ory/x/sqlcon"
 
 	"github.com/ory/kratos/schema"
 
@@ -39,20 +44,35 @@ import (
 )
 
 type (
+	PreHookExecutorParams struct {
+		Flow    *Flow
+		Session *session.Session
+	}
 	PreHookExecutor interface {
-		ExecuteSettingsPreHook(w http.ResponseWriter, r *http.Request, a *Flow, s *session.Session) error
+		ExecuteSettingsPreHook(w http.ResponseWriter, r *http.Request, params PreHookExecutorParams) error
 	}
-	PreHookExecutorFunc func(w http.ResponseWriter, r *http.Request, a *Flow, s *session.Session) error
+	PreHookExecutorFunc func(w http.ResponseWriter, r *http.Request, params PreHookExecutorParams) error
 
+	PostHookPrePersistExecutorParams struct {
+		Flow     *Flow
+		Identity *identity.Identity
+		Session  *session.Session
+	}
 	PostHookPrePersistExecutor interface {
-		ExecuteSettingsPrePersistHook(w http.ResponseWriter, r *http.Request, a *Flow, i *identity.Identity, s *session.Session) error
+		ExecuteSettingsPrePersistHook(w http.ResponseWriter, r *http.Request, params PostHookPrePersistExecutorParams) error
 	}
-	PostHookPrePersistExecutorFunc func(w http.ResponseWriter, r *http.Request, a *Flow, i *identity.Identity, s *session.Session) error
+	PostHookPrePersistExecutorFunc func(w http.ResponseWriter, r *http.Request, params PostHookPrePersistExecutorParams) error
 
-	PostHookPostPersistExecutor interface {
-		ExecuteSettingsPostPersistHook(w http.ResponseWriter, r *http.Request, a *Flow, id *identity.Identity, s *session.Session) error
+	PostHookPostPersistExecutorParams struct {
+		Flow     *Flow
+		Previous *identity.Identity
+		Updated  *identity.Identity
+		Session  *session.Session
 	}
-	PostHookPostPersistExecutorFunc func(w http.ResponseWriter, r *http.Request, a *Flow, id *identity.Identity, s *session.Session) error
+	PostHookPostPersistExecutor interface {
+		ExecuteSettingsPostPersistHook(w http.ResponseWriter, r *http.Request, params PostHookPostPersistExecutorParams) error
+	}
+	PostHookPostPersistExecutorFunc func(w http.ResponseWriter, r *http.Request, params PostHookPostPersistExecutorParams) error
 
 	HooksProvider interface {
 		PreSettingsHooks(ctx context.Context) ([]PreHookExecutor, error)
@@ -63,7 +83,11 @@ type (
 	executorDependencies interface {
 		identity.ManagementProvider
 		identity.ValidationProvider
+		identity.PoolProvider
+		identity.PrivilegedPoolProvider
+		identity.PendingTraitsChangePersistenceProvider
 		session.ManagementProvider
+		session.PersistenceProvider
 		config.Provider
 
 		HandlerProvider
@@ -74,6 +98,7 @@ type (
 		logrusx.Provider
 		httpx.WriterProvider
 		otelx.Provider
+		x.TransactionPersistenceProvider
 	}
 	HookExecutor struct {
 		d executorDependencies
@@ -83,16 +108,16 @@ type (
 	}
 )
 
-func (f PreHookExecutorFunc) ExecuteSettingsPreHook(w http.ResponseWriter, r *http.Request, a *Flow, s *session.Session) error {
-	return f(w, r, a, s)
+func (f PreHookExecutorFunc) ExecuteSettingsPreHook(w http.ResponseWriter, r *http.Request, params PreHookExecutorParams) error {
+	return f(w, r, params)
 }
 
-func (f PostHookPrePersistExecutorFunc) ExecuteSettingsPrePersistHook(w http.ResponseWriter, r *http.Request, a *Flow, i *identity.Identity, s *session.Session) error {
-	return f(w, r, a, i, s)
+func (f PostHookPrePersistExecutorFunc) ExecuteSettingsPrePersistHook(w http.ResponseWriter, r *http.Request, params PostHookPrePersistExecutorParams) error {
+	return f(w, r, params)
 }
 
-func (f PostHookPostPersistExecutorFunc) ExecuteSettingsPostPersistHook(w http.ResponseWriter, r *http.Request, a *Flow, id *identity.Identity, s *session.Session) error {
-	return f(w, r, a, id, s)
+func (f PostHookPostPersistExecutorFunc) ExecuteSettingsPostPersistHook(w http.ResponseWriter, r *http.Request, params PostHookPostPersistExecutorParams) error {
+	return f(w, r, params)
 }
 
 func PostHookPostPersistExecutorNames(e []PostHookPostPersistExecutor) []string {
@@ -200,7 +225,11 @@ func (e *HookExecutor) PostSettingsHook(ctx context.Context, w http.ResponseWrit
 			"flow_method":       settingsType,
 		}
 
-		if err := executor.ExecuteSettingsPrePersistHook(w, r, ctxUpdate.Flow, i, ctxUpdate.Session); err != nil {
+		if err := executor.ExecuteSettingsPrePersistHook(w, r, PostHookPrePersistExecutorParams{
+			Flow:     ctxUpdate.Flow,
+			Identity: i,
+			Session:  ctxUpdate.Session,
+		}); err != nil {
 			if errors.Is(err, ErrHookAbortFlow) {
 				e.d.Logger().WithRequest(r).WithFields(logFields).
 					Debug("A ExecuteSettingsPrePersistHook hook aborted early.")
@@ -264,8 +293,14 @@ func (e *HookExecutor) PostSettingsHook(ctx context.Context, w http.ResponseWrit
 	if err != nil {
 		return err
 	}
+	previous := ctxUpdate.GetSessionIdentity()
 	for k, executor := range postHooks {
-		if err := executor.ExecuteSettingsPostPersistHook(w, r, ctxUpdate.Flow, i, ctxUpdate.Session); err != nil {
+		if err := executor.ExecuteSettingsPostPersistHook(w, r, PostHookPostPersistExecutorParams{
+			Flow:     ctxUpdate.Flow,
+			Previous: previous,
+			Updated:  i,
+			Session:  ctxUpdate.Session,
+		}); err != nil {
 			if errors.Is(err, ErrHookAbortFlow) {
 				e.d.Logger().
 					WithRequest(r).
@@ -333,6 +368,171 @@ func (e *HookExecutor) PostSettingsHook(ctx context.Context, w http.ResponseWrit
 	return nil
 }
 
+// settingsTypePendingTraitsChange is the settings strategy the verify_new_address
+// hook is allowed to be configured under. The JSON config schema
+// (selfServiceAfterSettingsProfileMethod) only admits verify_new_address inside
+// the profile hook list, so a pending traits change can only ever originate
+// from the profile strategy.
+const settingsTypePendingTraitsChange = "profile"
+
+// ErrPendingTraitsChangeSessionInvalid is returned by ApplyPendingTraitsChange
+// when the session that created the pending change is missing, revoked,
+// expired, disabled, or belongs to a different tenant. Callers should treat
+// this as "the verification attempt is invalid" — the change is not applied.
+var ErrPendingTraitsChangeSessionInvalid = stderrors.New("pending traits change session is no longer valid")
+
+// ApplyPendingTraitsChange commits a pending traits change to the identity and
+// fires the "after profile settings, post-persist" hook chain. It is the
+// single entry point verification strategies use to resolve a pending change
+// created by a settings flow.
+//
+// The originating session is validated inside the same transaction that
+// applies the change, so a session that is revoked between the caller's
+// token/code consumption and this call is still rejected. If validation
+// succeeds, the loaded session is reused for the hook chain — no second
+// GetSession round-trip.
+//
+// Returns ErrPendingTraitsChangeSessionInvalid when the session is not usable.
+// Returns identity.ErrConcurrentModification when the identity's traits have
+// drifted since the change was proposed.
+func (e *HookExecutor) ApplyPendingTraitsChange(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+	ptc *identity.PendingTraitsChange,
+) (i *identity.Identity, err error) {
+	ctx, span := e.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.flow.settings.HookExecutor.ApplyPendingTraitsChange")
+	defer otelx.End(span, &err)
+
+	// Reject PTCs whose FK references were nulled or never written. The
+	// session FK is ON DELETE SET NULL and the origin-flow FK is ON
+	// DELETE CASCADE, so a NULL here means either a revoked session or
+	// a writer that failed to set the link.
+	if !ptc.SessionID.Valid || !ptc.OriginSettingsFlowID.Valid {
+		return nil, errors.WithStack(ErrPendingTraitsChangeSessionInvalid)
+	}
+
+	var (
+		sess *session.Session
+		// Capture the pre-change identity before sess.Identity is overwritten
+		// below so post-persist hooks (notify_previous_addresses) can compute
+		// diffs without re-reading the row.
+		previous *identity.Identity
+	)
+	err = e.d.TransactionalPersisterProvider().Transaction(ctx, func(ctx context.Context, _ *pop.Connection) error {
+		// ExpandDefault loads the session's identity in the same query,
+		// so IsActive() below checks the identity's active state and we
+		// avoid a second round-trip to IdentityPool.GetIdentity for the
+		// hash comparison.
+		s, sErr := e.d.SessionPersister().GetSession(ctx, ptc.SessionID.UUID, session.ExpandDefault)
+		if sErr != nil {
+			if errors.Is(sErr, sqlcon.ErrNoRows()) {
+				return errors.WithStack(ErrPendingTraitsChangeSessionInvalid)
+			}
+			return sErr
+		}
+		if s.NID != ptc.NID || !s.IsActive() {
+			return errors.WithStack(ErrPendingTraitsChangeSessionInvalid)
+		}
+		// TODO(jonas): We can likely drop the identity id column entirely, since the session's identity is always loaded and we check the ID matches here. This would simplify the schema and remove a potential source of FK inconsistency.
+		if s.Identity == nil || s.Identity.ID != ptc.IdentityID {
+			return errors.WithStack(ErrPendingTraitsChangeSessionInvalid)
+		}
+		previous = s.Identity
+		sess = s
+
+		if identity.HashTraits(json.RawMessage(s.Identity.Traits)) != ptc.OriginalTraitsHash {
+			return identity.ErrConcurrentModification
+		}
+
+		if err := e.d.IdentityManager().UpdateTraits(
+			ctx, ptc.IdentityID, identity.Traits(ptc.ProposedTraits),
+			identity.ManagerAllowWriteProtectedTraits,
+		); err != nil {
+			return err
+		}
+
+		// The PTC Status column is informational only; the real
+		// single-submit guard is the verification flow state machine
+		// (StatePassedChallenge) plus atomic token/code consumption.
+		// We intentionally do not write Status here.
+
+		// Re-read the identity after UpdateTraits so the returned
+		// snapshot reflects the freshly-committed state, including any
+		// VerifiableAddress row UpdateTraits may have created for the
+		// new address.
+		updated, err := e.d.IdentityPool().GetIdentity(ctx, ptc.IdentityID, identity.ExpandDefault)
+		if err != nil {
+			return err
+		}
+
+		for idx := range updated.VerifiableAddresses {
+			a := &updated.VerifiableAddresses[idx]
+			if a.Value == ptc.NewAddressValue && a.Via == ptc.NewAddressVia {
+				a.Verified = true
+				verifiedAt := sqlxx.NullTime(time.Now().UTC())
+				a.VerifiedAt = &verifiedAt
+				a.Status = identity.VerifiableAddressStatusCompleted
+				if err := e.d.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, a, "verified", "verified_at", "status"); err != nil {
+					return err
+				}
+				break
+			}
+		}
+
+		i = updated
+		// Keep Session.Identity in sync so post-persist webhook templates render the committed traits and the newly-verified address.
+		// TODO: pointer aliasing could cause issues if a downstream hook implementation modifies the identity in-place instead of treating it as immutable. We should either enforce immutability or document this behavior.
+		sess.Identity = updated
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Fire the "profile" post-persist hooks. Load the originating settings flow
+	// so the hook chain receives a real Flow (honest ID, type, RequestURL)
+	// instead of a synthetic one. The FK is ON DELETE CASCADE, so if the flow
+	// was cleaned up the PTC was already deleted and we would not reach this
+	// call. Apply has already committed, so a hook error cannot roll the change
+	// back — we propagate errors so callers can surface them in the
+	// verification UI.
+	originFlow, err := e.d.SettingsFlowPersister().GetSettingsFlow(ctx, ptc.OriginSettingsFlowID.UUID)
+	if err != nil {
+		return nil, err
+	}
+	postHooks, err := e.d.PostSettingsPostPersistHooks(ctx, settingsTypePendingTraitsChange)
+	if err != nil {
+		return nil, err
+	}
+	for k, executor := range postHooks {
+		logFields := logrus.Fields{
+			"executor":          fmt.Sprintf("%T", executor),
+			"executor_position": k,
+			"executors":         PostHookPostPersistExecutorNames(postHooks),
+			"identity_id":       i.ID,
+			"flow_method":       settingsTypePendingTraitsChange,
+		}
+		if err := executor.ExecuteSettingsPostPersistHook(w, r, PostHookPostPersistExecutorParams{
+			Flow:     originFlow,
+			Previous: previous,
+			Updated:  i,
+			Session:  sess,
+		}); err != nil {
+			if errors.Is(err, ErrHookAbortFlow) {
+				e.d.Logger().WithRequest(r).WithFields(logFields).
+					Debug("A post-persist hook aborted the pending-traits-change continuation flow.")
+				return i, nil
+			}
+			return nil, err
+		}
+		e.d.Logger().WithRequest(r).WithFields(logFields).
+			Debug("ExecuteSettingsPostPersistHook completed successfully after pending traits change.")
+	}
+
+	return i, nil
+}
+
 func (e *HookExecutor) PreSettingsHook(ctx context.Context, w http.ResponseWriter, r *http.Request, a *Flow, s *session.Session) (err error) {
 	ctx, span := e.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.flow.settings.HookExecutor.PreSettingsHook")
 	defer otelx.End(span, &err)
@@ -342,7 +542,10 @@ func (e *HookExecutor) PreSettingsHook(ctx context.Context, w http.ResponseWrite
 		return err
 	}
 	for _, executor := range hooks {
-		if err := executor.ExecuteSettingsPreHook(w, r, a, s); err != nil {
+		if err := executor.ExecuteSettingsPreHook(w, r, PreHookExecutorParams{
+			Flow:    a,
+			Session: s,
+		}); err != nil {
 			return err
 		}
 	}

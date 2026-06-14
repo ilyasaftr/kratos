@@ -58,6 +58,7 @@ import (
 	"github.com/ory/kratos/x/webauthnx"
 	"github.com/ory/nosurf"
 	"github.com/ory/pop/v6"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/healthx"
@@ -78,9 +79,13 @@ type RegistryDefault struct {
 	l *logrusx.Logger
 	c *config.Config
 
+	// clock is the time source for time-dependent behavior such as flow expiry.
+	// It is set eagerly in initCheapMembers and replaced in tests via SetClock.
+	clock clock.Clock
+
 	ctxer contextx.Contextualizer
 
-	injectedSelfserviceHooks map[string]func(config.SelfServiceHook) interface{}
+	injectedSelfserviceHooks map[string]NewHookFn
 	extraHandlerFactories    []NewHandler
 	extraHandlers            []x.Handler
 	slOptions                *servicelocatorx.Options
@@ -250,6 +255,18 @@ func (m *RegistryDefault) SetLogger(l *logrusx.Logger) {
 	m.l = l
 }
 
+// Clock returns the registry's time source. It is eagerly initialized in
+// initCheapMembers, so this getter never lazily initializes.
+func (m *RegistryDefault) Clock() clock.Clock {
+	return m.clock
+}
+
+// SetClock replaces the registry's time source. Intended for tests that need
+// deterministic control over time-dependent behavior such as flow expiry.
+func (m *RegistryDefault) SetClock(c clock.Clock) {
+	m.clock = c
+}
+
 func (m *RegistryDefault) SetJSONNetVMProvider(p jsonnetsecure.VMProvider) {
 	m.jsonnetVMProvider.Set(p)
 }
@@ -395,6 +412,27 @@ nextStrategy:
 		}
 	}
 	return
+}
+
+// TestStrategy returns the OIDC strategy as a login.TestStrategy for
+// admin-created test login flows. Only the OIDC strategy implements the
+// test-mode single-provider UI. Returns nil if the OIDC strategy is not
+// registered or disabled in config; callers must handle that case as a
+// misconfiguration rather than crashing the process.
+func (m *RegistryDefault) TestStrategy(ctx context.Context) login.TestStrategy {
+	type testStrategy interface {
+		login.TestStrategy
+		login.Strategy
+	}
+	for _, strategy := range m.selfServiceStrategies() {
+		if s, ok := strategy.(testStrategy); ok {
+			if m.strategyLoginEnabled(ctx, s.ID().String()) {
+				return s
+			}
+		}
+	}
+
+	return nil
 }
 
 // supportsOrganizations checks if a strategy implements organization-based authentication.
@@ -740,6 +778,7 @@ func (m *RegistryDefault) PrivilegedIdentityPool() identity.PrivilegedPool { ret
 func (m *RegistryDefault) FlowForTokenExchange() session.FlowForTokenExchange {
 	return m
 }
+
 func (m *RegistryDefault) GetFlowForTokenExchange(ctx context.Context, flowID uuid.UUID) (any, error) {
 	rf, err := m.RegistrationFlowPersister().GetRegistrationFlow(ctx, flowID)
 	if err == nil {
@@ -772,15 +811,18 @@ func (m *RegistryDefault) LoginCodePersister() code.LoginCodePersister          
 func (m *RegistryDefault) VerificationTokenPersister() link.VerificationTokenPersister {
 	return m.persister
 }
+
 func (m *RegistryDefault) VerificationCodePersister() code.VerificationCodePersister {
 	return m.persister
 }
+
 func (m *RegistryDefault) RegistrationCodePersister() code.RegistrationCodePersister {
 	return m.persister
 }
 func (m *RegistryDefault) PendingTraitsChangePersister() identity.PendingTraitsChangePersister {
 	return m.Persister()
 }
+
 func (m *RegistryDefault) TransactionalPersisterProvider() x.TransactionalPersister {
 	return m.persister
 }
@@ -870,7 +912,9 @@ func (m *RegistryDefault) ExtraHandlers() []x.Handler {
 
 // initCheapMembers initializes members that are cheap to initialize.
 func (m *RegistryDefault) initCheapMembers() {
+	m.clock = clock.New()
 	m.identityValidator = identity.NewValidator(m)
+	m.identitySchemaProvider = schema.NewDefaultIdentityTraitsProvider(m)
 	m.identityManager = identity.NewManager(m)
 	m.sessionManager = session.NewManagerHTTP(m)
 	m.errorManager = errorx.NewManager(m)
