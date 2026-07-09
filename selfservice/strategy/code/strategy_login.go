@@ -239,6 +239,28 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		)
 		id, addresses, err := s.findIdentityForIdentifier(ctx, identifier, f.RequestedAAL, sess)
 		if err != nil {
+			if f.RequestedAAL == identity.AuthenticatorAssuranceLevel1 &&
+				s.deps.Config().SelfServiceCodeStrategy(ctx).PasswordlessEnabled {
+				if codeCred := new(schema.ValidationError); errors.As(err, &codeCred) && len(codeCred.Messages) > 0 && codeCred.Messages[0].ID == text.ErrorValidationNoCodeUser {
+					f.SetState(flow.StateEmailSent)
+					if err := s.NewCodeUINodes(r, f, &codeIdentifier{Identifier: identifier}); err != nil {
+						return nil, s.HandleLoginError(r, f, &p, err, false)
+					}
+
+					f.Active = identity.CredentialsTypeCodeAuth
+					if err = s.deps.LoginFlowPersister().UpdateLoginFlow(ctx, f); err != nil {
+						return nil, s.HandleLoginError(r, f, &p, err, false)
+					}
+
+					if x.IsJSONRequest(r) {
+						s.deps.Writer().WriteCode(w, r, http.StatusBadRequest, f)
+					} else {
+						http.Redirect(w, r, f.AppendTo(s.deps.Config().SelfServiceFlowLoginUI(ctx)).String(), http.StatusSeeOther)
+					}
+
+					return nil, s.HandleLoginError(r, f, &p, errors.WithStack(flow.ErrCompletedByStrategy), false)
+				}
+			}
 			return nil, s.HandleLoginError(r, f, &p, err, false)
 		}
 		// On a refresh login the identity is fixed by the active session.
@@ -601,6 +623,9 @@ func (s *Strategy) loginVerifyCode(ctx context.Context, f *login.Flow, p *update
 		i, _, err = s.findIdentityForIdentifier(ctx, p.Identifier, f.RequestedAAL, sess)
 	}
 	if err != nil {
+		if codeCred := new(schema.ValidationError); errors.As(err, &codeCred) && len(codeCred.Messages) > 0 && codeCred.Messages[0].ID == text.ErrorValidationNoCodeUser {
+			return nil, schema.NewLoginCodeInvalid()
+		}
 		return nil, err
 	}
 	// Defense in depth: a refresh login must complete against the session's
