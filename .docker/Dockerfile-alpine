@@ -1,32 +1,50 @@
-FROM alpine:3.20.0
+FROM golang:1.26-alpine AS builder
 
-# Because this image supports SQLite, we create /home/ory and /home/ory/sqlite which is owned by the ory user
-# and declare /home/ory/sqlite a volume.
-#
-# To get SQLite and Docker Volumes working with this image, mount the volume where SQLite should be written to at:
-#
-#   /home/ory/sqlite/some-file.
+RUN apk add --no-cache build-base sqlite-dev \
+  && mkdir -p /var/lib/sqlite
 
-RUN addgroup -S ory; \
-    adduser -S ory -G ory -D -u 10000 -h /home/ory -s /bin/nologin; \
-    chown -R ory:ory /home/ory
-RUN apk --update upgrade && apk --no-cache --update-cache --upgrade --latest add ca-certificates
+WORKDIR /go/src/github.com/ory/kratos
+
+COPY oryx/go.mod oryx/go.mod
+COPY oryx/go.sum oryx/go.sum
+
+COPY go.mod go.mod
+COPY go.sum go.sum
+COPY pkg/client-go/go.* pkg/client-go/
+
+ENV CGO_ENABLED=1
+ENV CGO_CPPFLAGS=-DSQLITE_DEFAULT_FILE_PERMISSIONS=0600
+
+RUN go mod download
+
+COPY . .
+
+ARG VERSION
+ARG COMMIT
+ARG BUILD_DATE
+
+RUN --mount=type=cache,target=/root/.cache/go-build go build \
+  -ldflags="-X 'github.com/ory/kratos/driver/config.Version=${VERSION}' -X 'github.com/ory/kratos/driver/config.Date=${BUILD_DATE}' -X 'github.com/ory/kratos/driver/config.Commit=${COMMIT}'" \
+  -o /usr/bin/kratos
+
+#########################
+
+FROM alpine:3.21
+
+RUN addgroup -S ory \
+    && adduser -S ory -G ory -D -u 10000 -h /home/ory -s /bin/nologin \
+    && apk --no-cache --update-cache --upgrade add ca-certificates sqlite-libs tzdata
 
 WORKDIR /home/ory
 
-COPY kratos /usr/bin/kratos
+COPY --from=builder /usr/bin/kratos /usr/bin/kratos
 
-# By creating the sqlite folder as the ory user, the mounted volume will be owned by ory:ory, which
-# is required for read/write of SQLite.
-RUN mkdir -p /var/lib/sqlite
-RUN chown ory:ory /var/lib/sqlite
+RUN mkdir -p /var/lib/sqlite \
+    && chown -R ory:ory /home/ory /var/lib/sqlite
+
 VOLUME /var/lib/sqlite
-
-# Exposing the ory home directory to simplify passing in Kratos configuration (e.g. if the file $HOME/.kratos.yaml
-# exists, it will be automatically used as the configuration file).
 VOLUME /home/ory
 
-# Declare the standard ports used by Kratos (4433 for public service endpoint, 4434 for admin service endpoint)
 EXPOSE 4433 4434
 
 USER 10000
