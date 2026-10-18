@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +34,6 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/pop/v6"
 	"github.com/ory/x/assertx"
-	"github.com/ory/x/contextx"
 	"github.com/ory/x/crdbx"
 	"github.com/ory/x/pagination/keysetpagination"
 	"github.com/ory/x/popx"
@@ -53,61 +54,83 @@ func assertContainsValues(t *testing.T, actual []string, shouldContain, shouldNo
 	}
 }
 
+// poolSchemaSet is the identity-schema set the TestPool contract exercises.
+//
+// Only ID and RawURL are set on each schema.Schema: the config carries RawURL
+// (see PoolConfigValues), and SchemaURL() derives the public URL from ID, so
+// schema.Schema.URL is never read here.
+type poolSchemaSet struct {
+	expand, def, alt, phoneEmail schema.Schema
+	publicBaseURL                *url.URL
+}
+
+func newPoolSchemaSet() poolSchemaSet {
+	return poolSchemaSet{
+		publicBaseURL: urlx.ParseOrPanic("http://example.com"),
+		expand: schema.Schema{
+			ID:     "expandSchema",
+			RawURL: "file://./stub/expand.schema.json",
+		},
+		def: schema.Schema{
+			ID:     config.DefaultIdentityTraitsSchemaID,
+			RawURL: "file://./stub/identity.schema.json",
+		},
+		alt: schema.Schema{
+			ID:     "altSchema",
+			RawURL: "file://./stub/identity-2.schema.json",
+		},
+		phoneEmail: schema.Schema{
+			ID:     "phoneIdentifier",
+			RawURL: "file://./stub/phone.schema.json",
+		},
+	}
+}
+
+// PoolConfigValues returns the configuration the TestPool contract requires.
+//
+// Prefer passing these to the registry as base config (configx.WithValues) over
+// attaching them to the context with contextx.WithConfigValues. A context
+// overlay makes TestConfigProvider.Config rebuild the whole koanf tree — schema
+// validation and a full re-flatten — on every config read underneath it, and
+// TestPool reads config from 187 subtests.
+func PoolConfigValues() map[string]any {
+	s := newPoolSchemaSet()
+	return map[string]any{
+		config.ViperKeyPublicBaseURL: s.publicBaseURL.String(),
+		// Set explicitly so callers do not also need the suite-wide
+		// testhelpers.WithDefaultIdentitySchema overlay — that overlay replaces
+		// the schema list below with a single "default" entry.
+		config.ViperKeyDefaultIdentitySchemaID: s.def.ID,
+		config.ViperKeyIdentitySchemas: []config.Schema{
+			{ID: s.alt.ID, URL: s.alt.RawURL},
+			{ID: s.def.ID, URL: s.def.RawURL},
+			{ID: s.expand.ID, URL: s.expand.RawURL},
+			// The multiple_emails schema is only registered so config accepts the
+			// ID; the contract never reads its traits, so it reuses altSchema's file.
+			{ID: "multiple_emails", URL: s.alt.RawURL},
+			{ID: s.phoneEmail.ID, URL: s.phoneEmail.RawURL},
+		},
+	}
+}
+
+// TestPool runs the identity persister contract. The caller must have the values
+// from PoolConfigValues in scope, ideally baked into the registry's base config.
 func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager, dbname string) func(t *testing.T) {
 	return func(t *testing.T) {
 		nid, p := testhelpers.NewNetworkUnlessExisting(t, ctx, p)
 
-		exampleServerURL := urlx.ParseOrPanic("http://example.com")
-		expandSchema := schema.Schema{
-			ID:     "expandSchema",
-			URL:    urlx.ParseOrPanic("file://./stub/expand.schema.json"),
-			RawURL: "file://./stub/expand.schema.json",
-		}
-		defaultSchema := schema.Schema{
-			ID:     config.DefaultIdentityTraitsSchemaID,
-			URL:    urlx.ParseOrPanic("file://./stub/identity.schema.json"),
-			RawURL: "file://./stub/identity.schema.json",
-		}
-		altSchema := schema.Schema{
-			ID:     "altSchema",
-			URL:    urlx.ParseOrPanic("file://./stub/identity-2.schema.json"),
-			RawURL: "file://./stub/identity-2.schema.json",
-		}
-		multipleEmailsSchema := schema.Schema{
-			ID:     "multiple_emails",
-			URL:    urlx.ParseOrPanic("file://./stub/handler/multiple_emails.schema.json"),
-			RawURL: "file://./stub/identity-2.schema.json",
-		}
-		phoneEmailSchema := schema.Schema{
-			ID:     "phoneIdentifier",
-			URL:    urlx.ParseOrPanic("file://./stub/phone.schema.json"),
-			RawURL: "file://./stub/phone.schema.json",
-		}
-		ctx := contextx.WithConfigValues(ctx, map[string]any{
-			config.ViperKeyPublicBaseURL: exampleServerURL.String(),
-			config.ViperKeyIdentitySchemas: []config.Schema{
-				{
-					ID:  altSchema.ID,
-					URL: altSchema.RawURL,
-				},
-				{
-					ID:  defaultSchema.ID,
-					URL: defaultSchema.RawURL,
-				},
-				{
-					ID:  expandSchema.ID,
-					URL: expandSchema.RawURL,
-				},
-				{
-					ID:  multipleEmailsSchema.ID,
-					URL: multipleEmailsSchema.RawURL,
-				},
-				{
-					ID:  phoneEmailSchema.ID,
-					URL: phoneEmailSchema.RawURL,
-				},
-			},
-		})
+		s := newPoolSchemaSet()
+		exampleServerURL := s.publicBaseURL
+		expandSchema, defaultSchema, altSchema := s.expand, s.def, s.alt
+		phoneEmailSchema := s.phoneEmail
+
+		// Fail fast (rather than deep inside case=expand) when the caller did not
+		// put PoolConfigValues into scope: without the schemas registered,
+		// ValidateIdentity returns an opaque schema-lookup error.
+		probe := identity.NewIdentity(expandSchema.ID)
+		probe.Traits = identity.Traits(`{"email":"probe@ory.sh","name":"probe"}`)
+		require.NoError(t, m.ValidateIdentity(ctx, probe, new(identity.ManagerOptions)),
+			"TestPool requires the schemas from identity.PoolConfigValues in scope")
 
 		t.Run("case=expand", func(t *testing.T) {
 			require.NoError(t, p.GetConnection(ctx).RawQuery("DELETE FROM identities WHERE nid = ?", nid).Exec())
@@ -688,6 +711,126 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				require.NoError(t, err)
 				createdIDs = append(createdIDs, unique.ID)
 			})
+
+			t.Run("case=transaction retry re-runs the batch create with the ids from the first attempt", func(t *testing.T) {
+				// A transaction retry discards the first attempt's writes and runs
+				// the closure passed to the Transaction helper again. The ids
+				// assigned during the first attempt (generated by the database on
+				// CockroachDB, by Go elsewhere) stay on the in-memory structs, so
+				// the second attempt inserts the same identities with pre-assigned
+				// ids. The result must be indistinguishable from a first-try
+				// success, in particular the child-table rows must be linked to
+				// the right identities.
+				//
+				// CreateIdentities joins a surrounding transaction, so the retry
+				// re-runs it as a whole — exactly what happens when the driver
+				// retries the transaction of a plain CreateIdentities call.
+				identities := make([]*identity.Identity, 4)
+				for i := range identities {
+					identities[i] = NewTestIdentity(2, "retry-batch", i)
+				}
+
+				attempt := 0
+				idsSeen := make(map[int][]uuid.UUID)
+				require.NoError(t, p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
+					attempt++
+					if err := p.CreateIdentities(ctx, identities); err != nil {
+						return err
+					}
+					for _, ident := range identities {
+						if !assert.NotEqual(t, uuid.Nil, ident.ID) {
+							return errors.New("identity id was not assigned")
+						}
+						idsSeen[attempt] = append(idsSeen[attempt], ident.ID)
+					}
+					if attempt == 1 {
+						// Force a genuine retryable error so the Transaction
+						// helper rolls this attempt back and re-runs the closure.
+						if dbname == "cockroach" {
+							return tx.RawQuery("SELECT crdb_internal.force_retry('1h'::INTERVAL)").Exec()
+						}
+						return sqlcon.ErrConcurrentUpdate()
+					}
+					return nil
+				}))
+				require.Equal(t, 2, attempt, "the transaction closure must have run twice")
+				assert.Equal(t, idsSeen[1], idsSeen[2], "the retry must reuse the ids assigned on the first attempt")
+
+				for _, ident := range identities {
+					fromDB, err := p.GetIdentity(ctx, ident.ID, identity.ExpandEverything)
+					require.NoError(t, err)
+					assert.Equal(t, ident.ID, fromDB.ID)
+					assert.Equal(t,
+						ident.Credentials[identity.CredentialsTypePassword].Identifiers,
+						fromDB.Credentials[identity.CredentialsTypePassword].Identifiers,
+						"the credentials must belong to the identity that carried them in the input batch")
+					assert.Len(t, fromDB.VerifiableAddresses, len(ident.VerifiableAddresses))
+					assert.Len(t, fromDB.RecoveryAddresses, len(ident.RecoveryAddresses))
+
+					// Clean up so the later list assertions, which expect every
+					// remaining identity to be tracked in createdIDs and to fit
+					// in a single page, are unaffected.
+					require.NoError(t, p.DeleteIdentity(ctx, ident.ID))
+				}
+			})
+
+			t.Run("case=transaction retry keeps partial-conflict semantics", func(t *testing.T) {
+				if dbname == "mysql" {
+					// Partial inserts are not supported on mysql.
+					t.Skip()
+				}
+
+				// Same retry scenario, but on the partial-inserts path: one
+				// identity in the batch conflicts on external_id with a
+				// pre-existing identity. The retry re-runs the batch with the ids
+				// assigned on the first attempt; the conflict must still be
+				// attributed to the same input identity and the non-conflicting
+				// one must be persisted.
+				existing := NewTestIdentity(1, "retry-partial-existing", 0)
+				existing.ExternalID = sqlxx.NullString("retry-partial-ext-0")
+				require.NoError(t, p.CreateIdentity(ctx, existing))
+
+				unique := NewTestIdentity(1, "retry-partial-unique", 1)
+				conflicting := NewTestIdentity(1, "retry-partial-conflict", 2)
+				conflicting.ExternalID = existing.ExternalID
+				batch := []*identity.Identity{unique, conflicting}
+
+				attempt := 0
+				var createErr error
+				require.NoError(t, p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
+					attempt++
+					createErr = p.CreateIdentities(ctx, batch)
+					if _, ok := errors.AsType[*identity.CreateIdentitiesError](createErr); createErr != nil && !ok {
+						return createErr
+					}
+					if attempt == 1 {
+						if dbname == "cockroach" {
+							return tx.RawQuery("SELECT crdb_internal.force_retry('1h'::INTERVAL)").Exec()
+						}
+						return sqlcon.ErrConcurrentUpdate()
+					}
+					return nil
+				}))
+				require.Equal(t, 2, attempt, "the transaction closure must have run twice")
+
+				errWithCtx := new(identity.CreateIdentitiesError)
+				require.ErrorAsf(t, createErr, &errWithCtx, "%#v", createErr)
+				assert.NotNil(t, errWithCtx.Find(conflicting), "the conflict must be attributed to the conflicting input identity")
+				assert.Nil(t, errWithCtx.Find(unique))
+
+				fromDB, err := p.GetIdentity(ctx, unique.ID, identity.ExpandNothing)
+				require.NoError(t, err)
+				assert.Equal(t, unique.ID, fromDB.ID)
+
+				_, err = p.GetIdentity(ctx, conflicting.ID, identity.ExpandNothing)
+				require.Error(t, err, "the conflicting identity must not be persisted")
+
+				// Clean up so the later list assertions, which expect every
+				// remaining identity to be tracked in createdIDs and to fit in
+				// a single page, are unaffected.
+				require.NoError(t, p.DeleteIdentity(ctx, unique.ID))
+				require.NoError(t, p.DeleteIdentity(ctx, existing.ID))
+			})
 		})
 
 		t.Run("case=external_id conflict in batch create returns partial error", func(t *testing.T) {
@@ -967,6 +1110,65 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 			assert.Equal(t, identity.StateActive, actual.State, "the state remains unchanged")
 		})
 
+		t.Run("case=update external_id via UpdateIdentity", func(t *testing.T) {
+			externalID := sqlxx.NullString("ext-update-" + randx.MustString(10, randx.AlphaNum))
+
+			initial := oidcIdentity("", x.NewUUID().String())
+			initial.ExternalID = externalID
+			require.NoError(t, p.CreateIdentity(ctx, initial))
+			createdIDs = append(createdIDs, initial.ID)
+
+			t.Run("case=updating other fields keeps external_id unchanged", func(t *testing.T) {
+				// Loaded twice so the from-database snapshot and the update
+				// target are independent objects, matching how the update is
+				// driven in production.
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				updated, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+
+				updated.State = identity.StateInactive
+				require.NoError(t, p.UpdateIdentity(ctx, updated, identity.DiffAgainst(fromDB)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				assert.Equal(t, identity.StateInactive, actual.State)
+				assert.Equal(t, externalID, actual.ExternalID, "external_id is preserved when it does not change")
+			})
+
+			t.Run("case=changing external_id persists the new value", func(t *testing.T) {
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				updated, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+
+				newExternalID := sqlxx.NullString("ext-update-" + randx.MustString(10, randx.AlphaNum))
+				updated.ExternalID = newExternalID
+				require.NoError(t, p.UpdateIdentity(ctx, updated, identity.DiffAgainst(fromDB)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				assert.Equal(t, newExternalID, actual.ExternalID)
+			})
+
+			t.Run("case=changing external_id to an existing one is rejected", func(t *testing.T) {
+				other := oidcIdentity("", x.NewUUID().String())
+				otherExternalID := sqlxx.NullString("ext-update-" + randx.MustString(10, randx.AlphaNum))
+				other.ExternalID = otherExternalID
+				require.NoError(t, p.CreateIdentity(ctx, other))
+				createdIDs = append(createdIDs, other.ID)
+
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				updated, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+
+				updated.ExternalID = otherExternalID
+				require.Error(t, p.UpdateIdentity(ctx, updated, identity.DiffAgainst(fromDB)),
+					"the external_id unique constraint is still enforced when the value changes")
+			})
+		})
+
 		t.Run("case=should fail to insert identity because credentials from traits exist", func(t *testing.T) {
 			email := randx.MustString(16, randx.AlphaLowerNum) + "@ory.sh"
 			first := passwordIdentity("", email)
@@ -1105,34 +1307,40 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				require.NoError(t, err)
 				require.Len(t, is, len(createdIDs))
 
-				var results []identity.Identity
-				// It takes about 4.8 seconds to replicate the data.
-				for i := 0; i < 8; i++ {
-					time.Sleep(time.Second)
-
-					// The error here is explicitly ignored because the table / schema might not yet be replicated.
-					// This can lead to "ERROR: cached plan must not change result type (SQLSTATE 0A000)" whih is caused
-					// because the prepared query exist but the schema is not yet replicated.
+				// The data is replicated with eventual consistency (usually a few
+				// seconds). Poll until every identity is visible instead of sleeping
+				// a fixed 8 seconds, so the test returns as soon as replication
+				// completes.
+				listEventually := func() []identity.Identity {
+					// The error is intentionally ignored because the table / schema
+					// might not yet be replicated. This can surface as "cached plan
+					// must not change result type (SQLSTATE 0A000)" because the
+					// prepared query exists but the schema is not yet replicated.
 					is, _, _ := p.ListIdentities(ctx, identity.ListIdentityParameters{
 						Expand:           identity.ExpandEverything,
 						KeySetPagination: []keysetpagination.Option{keysetpagination.WithSize(25)},
 						ConsistencyLevel: crdbx.ConsistencyLevelEventual,
 					})
-
-					if len(is) == len(createdIDs) {
-						results = is
-					}
+					return is
 				}
-				require.NotZero(t, len(results))
-				require.Len(t, results, len(createdIDs), "Could not find all identities after 8 seconds")
-
-				var found bool
-				for _, i := range results {
-					if i.ID == another.ID {
-						found = true
+				// Assert the full count and the specific identity on the same
+				// snapshot inside the poll. A follower read can return a stale
+				// snapshot whose count matches len(createdIDs) but that does not
+				// yet contain the just-created identity, so checking the count and
+				// the identity against separate reads is racy.
+				require.EventuallyWithT(t, func(t *assert.CollectT) {
+					results := listEventually()
+					if !assert.Len(t, results, len(createdIDs), "Could not find all identities") {
+						return
 					}
-				}
-				require.True(t, found, id, "Unable to find created identity in eventually consistent results.")
+					var found bool
+					for _, i := range results {
+						if i.ID == another.ID {
+							found = true
+						}
+					}
+					assert.True(t, found, "Unable to find created identity %s in eventually consistent results.", another.ID)
+				}, 15*time.Second, 200*time.Millisecond)
 			})
 		})
 
@@ -3395,6 +3603,81 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 			// not its content. Content updates must not consume it, or future
 			// schema migrations keyed on version become impossible.
 			assert.Equal(t, versionBefore, c.Version, "content updates must not bump the config-schema version column")
+		})
+
+		t.Run("case=UpdateCredentialsConfig survives concurrent plain writes", func(t *testing.T) {
+			t.Parallel()
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"plain-writes-key-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			// Plain single-statement writes commit freely while the locked
+			// mutation's transaction is open: pop's SQLite transaction mutex
+			// does not cover them, and on the cluster databases they contend
+			// only on row locks. They model the flow and session writes that
+			// surround a login burst.
+			stop := make(chan struct{})
+			var noise sync.WaitGroup
+			var noiseWrites atomic.Int64
+			for w := range 3 {
+				noise.Go(func() {
+					// Bind a value that changes on every write: SQLite skips the
+					// page write (and thus the WAL commit) when an UPDATE leaves
+					// the row byte-identical, and a commit that appends nothing
+					// stales nobody's snapshot.
+					ts := time.Now().Add(time.Duration(w) * time.Hour)
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						ts = ts.Add(time.Second)
+						if err := p.GetConnection(ctx).RawQuery(
+							"UPDATE identities SET updated_at = ? WHERE id = ?", ts, id.ID).Exec(); err != nil {
+							return
+						}
+						noiseWrites.Add(1)
+					}
+				})
+			}
+			t.Cleanup(func() {
+				close(stop)
+				noise.Wait()
+				require.NotZero(t, noiseWrites.Load(), "the concurrent writer must actually have written")
+			})
+
+			const n = 10
+			for i := range n {
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) {
+						var parsed map[string]int
+						if err := json.Unmarshal(cfg, &parsed); err != nil {
+							return nil, err
+						}
+						parsed["failed_attempts"]++
+						// Give the concurrent writers room to commit between this
+						// transaction's read and its write, so the race is a
+						// certainty instead of a scheduling accident.
+						time.Sleep(10 * time.Millisecond)
+						return json.Marshal(parsed)
+					}), "mutation %d must not leak a concurrent-update error", i)
+			}
+
+			reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			var counts map[string]int
+			require.NoError(t, json.Unmarshal(c.Config, &counts))
+			assert.Equal(t, n, counts["failed_attempts"], "every increment must be applied exactly once")
 		})
 
 		t.Run("case=UpdateCredentialsConfig no-op mutation succeeds", func(t *testing.T) {

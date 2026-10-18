@@ -38,6 +38,7 @@ import (
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/transaction"
 	"github.com/ory/x/clock"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/logrusx"
@@ -69,7 +70,7 @@ type (
 		httpx.WriterProvider
 		logrusx.Provider
 		otelx.Provider
-		x.TransactionPersistenceProvider
+		transaction.PersistenceProvider
 
 		config.Provider
 
@@ -286,7 +287,9 @@ func (s *Strategy) populateChooseMethodFlow(r *http.Request, f flow.Flow) error 
 		if f.RequestedAAL == identity.AuthenticatorAssuranceLevel2 {
 			via := r.URL.Query().Get("via")
 
-			sess, err := s.deps.SessionManager().FetchFromRequest(r.Context(), r)
+			// The full expansion is required: finding the code addresses reads the identity's
+			// credentials.
+			sess, err := s.deps.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 			if err != nil {
 				return err
 			}
@@ -312,7 +315,9 @@ func (s *Strategy) populateChooseMethodFlow(r *http.Request, f flow.Flow) error 
 			// login look like a fresh unified login (ory/kratos#4194). Instead,
 			// render one "Send code to <address>" button per available code address,
 			// exactly like the second-factor flow above.
-			sess, err := s.deps.SessionManager().FetchFromRequest(ctx, r)
+			// The full expansion is required: finding the code addresses reads the identity's
+			// credentials.
+			sess, err := s.deps.SessionManager().FetchFromRequest(ctx, r, session.ExpandEverything, identity.ExpandEverything)
 			if err != nil {
 				return err
 			}

@@ -30,6 +30,7 @@ import (
 	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/strategy/oidc"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/httpx"
@@ -73,6 +74,7 @@ func (token idTokenClaims) MarshalJSON() ([]byte, error) {
 }
 
 func createClient(t *testing.T, remote string, redir []string) (id, secret string) {
+	client := testhelpers.NewTestClient(t)
 	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		var b bytes.Buffer
 		require.NoError(t, json.NewEncoder(&b).Encode(&struct {
@@ -111,7 +113,7 @@ func createClient(t *testing.T, remote string, redir []string) (id, secret strin
 			TokenEndpointAuthMethod: "client_secret_post",
 		}))
 
-		res, err := http.Post(remote+"/admin/clients", "application/json", &b)
+		res, err := client.Post(remote+"/admin/clients", "application/json", &b)
 		require.NoError(t, err)
 		defer func() { _ = res.Body.Close() }()
 
@@ -139,12 +141,13 @@ type hydraFlowParams struct {
 }
 
 func wrapClientForHydraLoginConsent(t *testing.T, wrapped *http.Client, hydraAdmin string, params hydraFlowParams) *http.Client {
+	adminClient := testhelpers.NewTestClient(t)
 	doPut := func(href, payload string) string {
 		req, err := http.NewRequest("PUT", hydraAdmin+href, strings.NewReader(payload))
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 
-		res, err := http.DefaultClient.Do(req)
+		res, err := adminClient.Do(req)
 		require.NoError(t, err)
 		defer func() { _ = res.Body.Close() }()
 
@@ -243,53 +246,63 @@ func newHydra(t *testing.T) (remoteAdmin, remotePublic string) {
 	start := time.Now()
 	if remotePublic == "" && remoteAdmin == "" {
 		t.Logf("Environment did not provide Ory Hydra, starting fresh.")
-		publicPort, err := freeport.GetFreePort()
-		require.NoError(t, err)
-
 		pool := dockertest.NewPoolT(t, "")
 
-		hydra := pool.RunT(t, "oryd/hydra",
-			// Keep tag in sync with the version in ci.yaml
-			dockertest.WithTag("v2.2.0"),
-			dockertest.WithoutReuse(),
-			dockertest.WithEnv([]string{
-				"DSN=memory",
-				fmt.Sprintf("URLS_SELF_ISSUER=http://127.0.0.1:%d/", publicPort),
-				"URLS_LOGIN=" + hydraLoginURL,
-				"URLS_CONSENT=" + hydraConsentURL,
-				"LOG_LEAK_SENSITIVE_VALUES=true",
-				"SECRETS_SYSTEM=someverylongsecretthatis32byteslong",
-			}),
-			dockertest.WithCmd([]string{"serve", "all", "--dev"}),
-			dockertest.WithContainerConfig(func(cc *container.Config) {
-				cc.ExposedPorts = network.PortSet{
-					network.MustParsePort("4444/tcp"): struct{}{},
-					network.MustParsePort("4445/tcp"): struct{}{},
-				}
-			}),
-			dockertest.WithHostConfig(func(hc *container.HostConfig) {
-				hc.PortBindings = network.PortMap{
-					network.MustParsePort("4444/tcp"): {{HostPort: strconv.Itoa(publicPort)}},
-					network.MustParsePort("4445/tcp"): {{HostPort: ""}},
-				}
-			}),
-		)
+		// The public host port must be known before the container starts because
+		// it is part of URLS_SELF_ISSUER. freeport releases the port before Docker
+		// binds it, so another process can grab it in between — retry on that race.
+		var hydra dockertest.ClosableResource
+		ctx := t.Context()
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			publicPort, err := freeport.GetFreePort()
+			require.NoError(t, err)
+
+			hydra, err = pool.Run(ctx, "oryd/hydra",
+				// Keep tag in sync with the version in ci.yaml
+				dockertest.WithTag("v2.2.0"),
+				dockertest.WithoutReuse(),
+				dockertest.WithEnv([]string{
+					"DSN=memory",
+					fmt.Sprintf("URLS_SELF_ISSUER=http://127.0.0.1:%d/", publicPort),
+					"URLS_LOGIN=" + hydraLoginURL,
+					"URLS_CONSENT=" + hydraConsentURL,
+					"LOG_LEAK_SENSITIVE_VALUES=true",
+					"SECRETS_SYSTEM=someverylongsecretthatis32byteslong",
+				}),
+				dockertest.WithCmd([]string{"serve", "all", "--dev"}),
+				dockertest.WithContainerConfig(func(cc *container.Config) {
+					cc.ExposedPorts = network.PortSet{
+						network.MustParsePort("4444/tcp"): struct{}{},
+						network.MustParsePort("4445/tcp"): struct{}{},
+					}
+				}),
+				dockertest.WithHostConfig(func(hc *container.HostConfig) {
+					hc.PortBindings = network.PortMap{
+						network.MustParsePort("4444/tcp"): {{HostPort: strconv.Itoa(publicPort)}},
+						network.MustParsePort("4445/tcp"): {{HostPort: ""}},
+					}
+				}),
+			)
+			require.NoError(t, err)
+		}, 2*time.Minute, 100*time.Millisecond)
+		hydra.Cleanup(t)
 		require.NotEmpty(t, hydra.GetPort("4444/tcp"), "%+v", hydra.Container().NetworkSettings.Ports)
 		require.NotEmpty(t, hydra.GetPort("4445/tcp"), "%+v", hydra.Container)
 
 		remotePublic = "http://127.0.0.1:" + hydra.GetPort("4444/tcp")
 		remoteAdmin = "http://127.0.0.1:" + hydra.GetPort("4445/tcp")
 
+		client := testhelpers.NewTestClient(t)
 		require.EventuallyWithT(t, func(t *assert.CollectT) {
-			res, err := http.Get(remotePublic + "/health/ready") //nolint:gosec
+			res, err := client.Get(remotePublic + "/health/ready")
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, res.StatusCode)
 
-			res, err = http.Get(remotePublic + "/.well-known/openid-configuration") //nolint:gosec
+			res, err = client.Get(remotePublic + "/.well-known/openid-configuration")
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, res.StatusCode)
 
-			res, err = http.Get(remoteAdmin + "/health/ready") //nolint:gosec
+			res, err = client.Get(remoteAdmin + "/health/ready")
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, res.StatusCode)
 		}, 30*time.Second, 100*time.Millisecond)

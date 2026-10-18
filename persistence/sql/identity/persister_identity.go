@@ -608,6 +608,8 @@ func (p *IdentityPersister) updateCredentialsAssociation(ctx context.Context, ex
 		// Delete the credential and its identifiers.
 		conn := p.GetConnection(ctx)
 		q := "DELETE FROM identity_credentials WHERE nid = ? AND id IN (?)"
+		// This @index hint is CockroachDB-only; PostgreSQL and YugabyteDB use
+		// the unadorned table name.
 		if conn.Dialect.Name() == "cockroach" {
 			q = "DELETE FROM identity_credentials@primary WHERE nid = ? AND id IN (?)"
 		}
@@ -768,6 +770,28 @@ func (p *IdentityPersister) CreateIdentity(ctx context.Context, ident *identity.
 	return p.CreateIdentities(ctx, []*identity.Identity{ident})
 }
 
+// identitiesNeedPartialInserts reports whether a batch identity insert must use
+// partial inserts. Partial inserts pre-assign the ids so a conflicting row can
+// be correlated back to its input, which keeps the id client-generated instead
+// of database-generated.
+//
+// The only unique constraint on the identities table is on external_id (and it
+// is partial: it applies only when external_id is set). An identity insert can
+// therefore only conflict when an external_id is present, so partial inserts
+// are only needed when the batch has more than one row and at least one carries
+// an external_id. Otherwise a plain insert is enough; the downstream credential
+// and address inserts still use partial inserts to report their own conflicts.
+//
+// On a transaction retry, the ids generated during the first attempt (by the
+// database or by Go) remain on the in-memory structs, so the retried insert
+// reuses them instead of generating new ones. The identity pool contract test
+// covers this ("transaction retry" cases).
+func identitiesNeedPartialInserts(identities []*identity.Identity) bool {
+	return len(identities) > 1 && slices.ContainsFunc(identities, func(i *identity.Identity) bool {
+		return i.ExternalID != ""
+	})
+}
+
 func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities []*identity.Identity, opts ...identity.CreateIdentitiesModifier) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.CreateIdentities",
 		trace.WithAttributes(
@@ -820,7 +844,7 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities []*
 		if extras := options.ExtraColumns; len(extras) > 0 {
 			batchOpts = append(batchOpts, batch.WithExtraColumns(extras))
 		}
-		if len(identities) > 1 {
+		if identitiesNeedPartialInserts(identities) {
 			batchOpts = append(batchOpts, batch.WithPartialInserts)
 		}
 		if err := batch.Create(ctx, conn, identities, batchOpts...); err != nil {
@@ -1058,7 +1082,8 @@ func identifiersTableNameWithIndexHint(con *pop.Connection) string {
 	case "mysql":
 		ici += " USE INDEX(identity_credential_identifiers_ici_nid_i_idx)"
 	default:
-		// good luck 🤷‍♂️
+		// PostgreSQL and YugabyteDB do not accept these dialect-specific index
+		// hint syntaxes.
 	}
 	return ici
 }
@@ -1126,6 +1151,16 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 		nextPage = nil
 
 		if err := crdbx.SetTransactionReadOnly(con); err != nil {
+			return err
+		}
+
+		// This transaction runs up to five statements (credential-type lookup,
+		// page query, expansion queries over the page's identities). At
+		// SERIALIZABLE, a concurrent write to any of those identities between
+		// statements forces a read-refresh over the whole page and retries the
+		// transaction when it fails; READ COMMITTED absorbs those conflicts
+		// per-statement on the server.
+		if err := crdbx.SetTransactionReadCommitted(con); err != nil {
 			return err
 		}
 
@@ -1408,16 +1443,20 @@ func (p *IdentityPersister) UpdateCredentialsConfig(ctx context.Context, identit
 	// CockroachDB (see the method doc). popx applies the isolation for
 	// Postgres/MySQL/CockroachDB and ignores it for SQLite.
 	txOpts := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	// Resolve the type id before the transaction (cached after the first
+	// load) so the locking SELECT touches only identity_credentials: a join
+	// under FOR UPDATE would lock the shared type row and serialize all
+	// updates of that type globally. Outside the transaction, because on
+	// SQLite a cache miss would take pop's statement mutex inside it (see
+	// the lock-order note below).
+	typeID, err := FindIdentityCredentialsTypeByName(p.c.WithContext(ctx), ct)
+	if err != nil {
+		return err
+	}
+
 	var wrote bool
 	if err := popx.TransactionWithOptions(ctx, p.c.WithContext(ctx), txOpts, func(ctx context.Context, tx *pop.Connection) error {
 		wrote = false
-		// Resolve the type id up front (cached) so the locking SELECT touches
-		// only identity_credentials: a join under FOR UPDATE would lock the
-		// shared type row and serialize all updates of that type globally.
-		typeID, err := FindIdentityCredentialsTypeByName(tx, ct)
-		if err != nil {
-			return err
-		}
 
 		// No index hint: the locking SELECT matches
 		// identity_credentials_identity_id_idx. Forcing @primary would make
@@ -1430,22 +1469,46 @@ func (p *IdentityPersister) UpdateCredentialsConfig(ctx context.Context, identit
 		  AND ic.identity_credential_type_id = ?` + extraSQL + `
 		FOR UPDATE`
 		selectArgs := append([]any{identityID, nid, typeID}, extraArgs...)
-		if tx.Dialect.Name() == "sqlite3" {
-			// SQLite has no FOR UPDATE; pop serializes whole SQLite
-			// transactions on an in-process mutex instead.
-			selectQuery = `
-			SELECT ic.id, ic.config
-			FROM identity_credentials ic
-			WHERE ic.identity_id = ?
-			  AND ic.nid = ?
-			  AND ic.identity_credential_type_id = ?` + extraSQL
-		}
 
 		var row struct {
 			ID     uuid.UUID            `db:"id"`
 			Config sqlxx.JSONRawMessage `db:"config"`
 		}
-		if err := tx.RawQuery(selectQuery, selectArgs...).First(&row); err != nil {
+		if tx.Dialect.Name() == "sqlite3" {
+			// SQLite has no FOR UPDATE; pop serializes whole SQLite
+			// transactions on an in-process mutex instead. That mutex does
+			// not cover plain single-statement writes (e.g. flow updates
+			// during a login burst), which commit freely while this
+			// transaction is open, and this read-then-write transaction is
+			// unsound against them in WAL mode: a deferred transaction takes
+			// its read snapshot at the first SELECT and upgrades to writer at
+			// the UPDATE, and if anything committed in between the upgrade
+			// fails immediately with SQLITE_BUSY_SNAPSHOT — busy_timeout
+			// cannot help a stale snapshot, and enough write traffic exhausts
+			// the retry budget in TransactionWithOptions. A no-op write as
+			// the transaction's first statement acquires the write lock up
+			// front (the in-transaction equivalent of BEGIN IMMEDIATE), so
+			// the snapshot is taken with the lock already held and concurrent
+			// writers wait on busy_timeout instead.
+			if err := tx.RawQuery("UPDATE identity_credentials SET id = id WHERE 1 = 0").Exec(); err != nil {
+				return sqlcon.HandleError(err)
+			}
+
+			// Read via the underlying sqlx transaction, not pop's finders:
+			// pop wraps SQLite reads in a process-wide statement mutex, which
+			// a concurrent model write may hold while it busy-waits on the
+			// very write lock the barrier above just took. Taking that mutex
+			// here, with the write lock held, would invert the lock order and
+			// park both sides until the busy timeout expires.
+			if err := tx.TX.GetContext(ctx, &row, `
+			SELECT ic.id, ic.config
+			FROM identity_credentials ic
+			WHERE ic.identity_id = ?
+			  AND ic.nid = ?
+			  AND ic.identity_credential_type_id = ?`+extraSQL, selectArgs...); err != nil {
+				return sqlcon.HandleError(err)
+			}
+		} else if err := tx.RawQuery(selectQuery, selectArgs...).First(&row); err != nil {
 			return sqlcon.HandleError(err)
 		}
 
@@ -1551,9 +1614,20 @@ func syncDerivedIdentifiers(ctx context.Context, conn *batch.TracerConnection, c
 	var rows []struct {
 		Identifier string `db:"identifier"`
 	}
-	if err := tx.RawQuery(
-		`SELECT identifier FROM identity_credential_identifiers WHERE identity_credential_id = ? AND nid = ?`+extraSQL,
-		append([]any{proto.IdentityCredentialsID, proto.NID}, extraArgs...)...).All(&rows); err != nil {
+	readQuery := `SELECT identifier FROM identity_credential_identifiers WHERE identity_credential_id = ? AND nid = ?` + extraSQL
+	readArgs := append([]any{proto.IdentityCredentialsID, proto.NID}, extraArgs...)
+	if tx.Dialect.Name() == "sqlite3" {
+		// Read via the underlying sqlx transaction, not pop's finders: this
+		// transaction already holds SQLite's write lock (the caller wrote the
+		// config, or took it up front via the write barrier), and pop's
+		// SQLite finders serialize on a process-wide statement mutex that a
+		// concurrent model write may hold while busy-waiting on that write
+		// lock — a lock-order inversion that parks both sides until the busy
+		// timeout expires.
+		if err := tx.TX.SelectContext(ctx, &rows, readQuery, readArgs...); err != nil {
+			return false, sqlcon.HandleError(err)
+		}
+	} else if err := tx.RawQuery(readQuery, readArgs...).All(&rows); err != nil {
 		return false, sqlcon.HandleError(err)
 	}
 	current := make([]string, len(rows))
@@ -1608,9 +1682,22 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 
 	i.NID = p.NetworkID(ctx)
 	i.UpdatedAt = time.Now().UTC().Truncate(time.Microsecond)
+	// external_id backs a unique index, so including it in the UPDATE ... SET
+	// list makes the database plan a uniqueness check for that index even when
+	// the value is unchanged. external_id almost never changes on an update, so
+	// when we have the previous row to compare against and it is unchanged, we
+	// leave it out of the SET list and the database skips the check. When we
+	// have no snapshot to compare against, or external_id did change, we write
+	// it and accept the check.
+	externalIDUnchanged := o.FromDatabase() != nil && o.FromDatabase().ExternalID == i.ExternalID
 	if err := sqlcon.HandleError(p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
 		// This returns "ErrNoRows" if the identity does not exist
-		if err := update.Generic(WithTransaction(ctx, tx), tx, p.r.Tracer(ctx).Tracer(), i); err != nil {
+		if externalIDUnchanged {
+			err = update.GenericExcept(WithTransaction(ctx, tx), tx, p.r.Tracer(ctx).Tracer(), i, "external_id")
+		} else {
+			err = update.Generic(WithTransaction(ctx, tx), tx, p.r.Tracer(ctx).Tracer(), i)
+		}
+		if err != nil {
 			return err
 		}
 
@@ -1717,6 +1804,8 @@ func (p *IdentityPersister) DeleteIdentity(ctx context.Context, id uuid.UUID) (e
 	defer otelx.End(span, &err)
 
 	tableName := new(identity.Identity).TableName(ctx)
+	// This @index hint is CockroachDB-only; PostgreSQL and YugabyteDB use the
+	// unadorned table name.
 	if p.c.Dialect.Name() == "cockroach" {
 		tableName += "@primary"
 	}
@@ -1762,6 +1851,8 @@ func (p *IdentityPersister) DeleteIdentities(ctx context.Context, ids []uuid.UUI
 	args = append(args, p.NetworkID(ctx))
 
 	tableName := new(identity.Identity).TableName(ctx)
+	// This @index hint is CockroachDB-only; PostgreSQL and YugabyteDB use the
+	// unadorned table name.
 	if p.c.Dialect.Name() == "cockroach" {
 		tableName += "@primary"
 	}

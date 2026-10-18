@@ -81,7 +81,7 @@ func TestStrategy(t *testing.T) {
 
 	returnTSRouter.HandleFunc("/app_code", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
 	returnTSRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		sess, err := reg.SessionManager().FetchFromRequest(r.Context(), r)
+		sess, err := reg.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 		if err != nil {
 			reg.Writer().WriteError(w, r, err)
 			return
@@ -205,7 +205,7 @@ func TestStrategy(t *testing.T) {
 	}
 
 	makeAPICodeFlowRequest := func(t *testing.T, client *http.Client, action, provider string, params hydraFlowParams) (returnToURL *url.URL) {
-		res, err := http.Post( // #nosec G107 -- test code
+		res, err := testhelpers.NewTestClient(t).Post(
 			action,
 			"application/json",
 			strings.NewReader(fmt.Sprintf(`
@@ -719,7 +719,8 @@ func TestStrategy(t *testing.T) {
 
 				var lastVia []*http.Request
 				hc := &http.Client{
-					Jar: j,
+					Jar:       j,
+					Transport: testhelpers.NewTestTransport(t),
 					CheckRedirect: func(req *http.Request, via []*http.Request) error {
 						lastVia = via
 						return nil
@@ -767,7 +768,7 @@ func TestStrategy(t *testing.T) {
 			//	} else if authenticated {
 			//		return <-- we end up here on the second call
 			//	}
-			res, err = (&http.Client{Jar: j}).Get(result[0])
+			res, err = (&http.Client{Jar: j, Transport: testhelpers.NewTestTransport(t)}).Get(result[0])
 			require.NoError(t, err)
 			body, err = io.ReadAll(res.Body)
 			require.NoError(t, err)
@@ -793,7 +794,7 @@ func TestStrategy(t *testing.T) {
 
 			// Doing the request but this time without the Ory Session Cookie. This may be the case in scenarios where we run into race conditions
 			// where the server sent a response but the client did not process it.
-			res, err = (&http.Client{Jar: secondJar}).Get(result[0])
+			res, err = (&http.Client{Jar: secondJar, Transport: testhelpers.NewTestTransport(t)}).Get(result[0])
 			require.NoError(t, err)
 			body, err = io.ReadAll(res.Body)
 			require.NoError(t, err)
@@ -969,7 +970,7 @@ func TestStrategy(t *testing.T) {
 			f := newAPIRegistrationFlow(t, returnTS.URL+"?return_session_token_exchange_code=true&return_to=/app_code", time.Minute)
 			action := assertFormValues(t, f.ID, "valid")
 
-			res, err := http.Post(action, "application/json", // #nosec G107 -- test code
+			res, err := testhelpers.NewTestClient(t).Post(action, "application/json",
 				strings.NewReader(fmt.Sprintf(`{"method":"oidc","provider":"valid","transient_payload":%s}`, transientPayload)))
 			require.NoError(t, err)
 			require.Equal(t, http.StatusUnprocessableEntity, res.StatusCode)
@@ -1005,7 +1006,7 @@ func TestStrategy(t *testing.T) {
 			f := newAPILoginFlow(t, returnTS.URL+"?return_session_token_exchange_code=true&return_to=/app_code", time.Minute)
 			action := assertFormValues(t, f.ID, "valid")
 
-			res, err := http.Post(action, "application/json", // #nosec G107 -- test code
+			res, err := testhelpers.NewTestClient(t).Post(action, "application/json",
 				strings.NewReader(fmt.Sprintf(`{"method":"oidc","provider":"valid","transient_payload":%s}`, transientPayload)))
 			require.NoError(t, err)
 			require.Equal(t, http.StatusUnprocessableEntity, res.StatusCode)
@@ -1044,7 +1045,7 @@ func TestStrategy(t *testing.T) {
 				f := newAPIRegistrationFlow(t, returnTS.URL+"?return_session_token_exchange_code=true&return_to=/app_code&identity_schema", time.Minute)
 				action := assertFormValues(t, f.ID, "valid")
 
-				res, err := http.Post(action, "application/json", // #nosec G107 -- test code
+				res, err := testhelpers.NewTestClient(t).Post(action, "application/json",
 					strings.NewReader(`{"method":"oidc","provider":"valid","traits.name":"i"}`))
 				require.NoError(t, err)
 				require.Equal(t, http.StatusUnprocessableEntity, res.StatusCode)
@@ -1062,7 +1063,7 @@ func TestStrategy(t *testing.T) {
 				f = newAPIRegistrationFlow(t, returnTS.URL+"?return_session_token_exchange_code=true&return_to=/app_code", time.Minute)
 				action = assertFormValues(t, f.ID, "valid")
 
-				res, err = http.Post(action, "application/json", // #nosec G107 -- test code
+				res, err = testhelpers.NewTestClient(t).Post(action, "application/json",
 					strings.NewReader(`{"method":"oidc","provider":"valid","traits.name":"valid-name"}`))
 				require.NoError(t, err)
 				require.Equal(t, http.StatusUnprocessableEntity, res.StatusCode)
@@ -1183,7 +1184,7 @@ func TestStrategy(t *testing.T) {
 			})
 		oidc.RegisterTestProvider(t, "test-provider")
 
-		cl := http.Client{}
+		cl := http.Client{Transport: testhelpers.NewTestTransport(t)}
 
 		type testCase struct {
 			name     string
@@ -1673,6 +1674,7 @@ func TestStrategy(t *testing.T) {
 
 		// We need to disable redirects because the upstream parameters are only passed on to the provider
 		c := &http.Client{
+			Transport:     testhelpers.NewTestTransport(t),
 			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		}
 
@@ -1963,6 +1965,75 @@ func TestStrategy(t *testing.T) {
 				checkCredentialsLinked(t, res, body, identityID, "secondProvider", email1)
 			})
 		})
+	})
+
+	t.Run("case=account linking still works when registration is disabled", func(t *testing.T) {
+		conf.MustSet(t.Context(), config.ViperKeySelfServiceRegistrationEnabled, false)
+		conf.MustSet(t.Context(), config.ViperKeySelfServiceRegistrationLoginHints, true)
+		t.Cleanup(func() {
+			ctx := context.WithoutCancel(t.Context())
+			conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnabled, true)
+		})
+
+		subject := "linking-registration-disabled@ory.sh"
+		password := "lwkj52sdkjf" // #nosec G101
+		scope := []string{"openid"}
+
+		var i *identity.Identity
+		t.Run("step=create password identity", func(t *testing.T) {
+			i = identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+			p, err := reg.Hasher(t.Context()).Generate(t.Context(), []byte(password))
+			require.NoError(t, err)
+			i.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+				Identifiers: []string{subject},
+				Config:      sqlxx.JSONRawMessage(`{"hashed_password":"` + string(p) + `"}`),
+			})
+			i.Traits = identity.Traits(`{"subject":"` + subject + `"}`)
+			require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(t.Context(), i))
+		})
+
+		client := testhelpers.NewClientWithCookies(t)
+		loginFlow := newLoginFlow(t, returnTS.URL, time.Minute, flow.TypeBrowser)
+
+		var linkingLoginFlow struct {
+			UIAction  string
+			CSRFToken string
+		}
+
+		t.Run("step=converts to a linking login flow despite disabled registration", func(t *testing.T) {
+			res, body := loginWithOIDC(t, client, loginFlow.ID, "valid", subject, scope)
+			assertUIError(t, res, body, "You tried to sign in with")
+			assert.Equal(t, subject, gjson.GetBytes(body, "ui.messages.#(id==1010016).context.duplicateIdentifier").String(), "%s", body)
+			linkingLoginFlow.UIAction = gjson.GetBytes(body, "ui.action").String()
+			linkingLoginFlow.CSRFToken = gjson.GetBytes(body, `ui.nodes.#(attributes.name=="csrf_token").attributes.value`).String()
+		})
+
+		t.Run("step=confirm with password and link", func(t *testing.T) {
+			res, err := client.PostForm(linkingLoginFlow.UIAction, url.Values{
+				"csrf_token": {linkingLoginFlow.CSRFToken},
+				"method":     {"password"},
+				"identifier": {subject},
+				"password":   {password},
+			})
+			require.NoError(t, err, linkingLoginFlow.UIAction)
+			body, err := io.ReadAll(res.Body)
+			require.NoError(t, res.Body.Close())
+			require.NoError(t, err)
+			checkCredentialsLinked(t, res, body, i.ID, "valid", subject)
+		})
+	})
+
+	t.Run("case=unknown user is still rejected when registration is disabled", func(t *testing.T) {
+		conf.MustSet(t.Context(), config.ViperKeySelfServiceRegistrationEnabled, false)
+		t.Cleanup(func() {
+			ctx := context.WithoutCancel(t.Context())
+			conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnabled, true)
+		})
+
+		client := testhelpers.NewClientWithCookies(t)
+		loginFlow := newLoginFlow(t, returnTS.URL, time.Minute, flow.TypeBrowser)
+		res, body := loginWithOIDC(t, client, loginFlow.ID, "valid", testhelpers.RandomEmail(), []string{"openid"})
+		assertUIError(t, res, body, "Registration is not allowed because it was disabled")
 	})
 
 	t.Run("suite=auto link policy", func(t *testing.T) {
@@ -2491,6 +2562,7 @@ func TestPostEndpointRedirect(t *testing.T) {
 		t.Run("case=should redirect to GET and preserve parameters/id="+providerID, func(t *testing.T) {
 			// create a client that does not follow redirects
 			c := &http.Client{
+				Transport: testhelpers.NewTestTransport(t),
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					return http.ErrUseLastResponse
 				},
