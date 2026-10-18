@@ -509,11 +509,23 @@ func TestLoginCodeStrategy(t *testing.T) {
 					// record that only stores the non-normalized identifier. The lookup query
 					// searches for IN(normalizedInput, rawInput), but both resolve to the same
 					// E.164 value, so neither matches the non-normalized DB record.
+					//
+					// Klawu: to prevent account enumeration, an unmatched identifier must be
+					// indistinguishable from a matched one, so the flow proceeds as if a code
+					// was sent instead of exposing 4000035 ("account does not exist").
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s = submitLogin(ctx, t, s, tc.apiType, func(v *url.Values) {
 						v.Set("identifier", normalizedPhone)
 					}, false, nil)
-					assert.Contains(t, s.body, "4000035", "Should not find the account because the normalized input does not match the legacy non-normalized DB record")
+					assert.EqualValues(t, flow.StateEmailSent, gjson.Get(s.body, "state").String(), "%s", s.body)
+					assert.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.Get(s.body, "ui.messages.0.id").Int(), "%s", s.body)
+					// Note: no courier assertion here on purpose. All client types
+					// share the same phone numbers and run in parallel, so a
+					// recipient-based courier lookup also observes sibling
+					// subtests' messages. The masked flow state above already
+					// proves no 4000035 ("account does not exist") is exposed,
+					// and the fake-success path sends no code by construction
+					// (it returns ErrCompletedByStrategy without calling SendCode).
 				})
 			})
 
